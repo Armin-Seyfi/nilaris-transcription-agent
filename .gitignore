@@ -1,0 +1,23 @@
+# API credentials
+.env
+.env.*
+!.env.example
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+
+# Private meeting data
+recordings/
+outputs/
+*.mp3
+*.wav
+*.m4a
+
+# macOS
+.DS_Store
+
+# Jupyter
+.ipynb_checkpoints/
