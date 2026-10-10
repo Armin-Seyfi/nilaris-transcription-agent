@@ -1,0 +1,1081 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>Nilaris | Meeting Recorder</title>
+
+    <style>
+        * { box-sizing: border-box; }
+
+        body {
+            margin: 0;
+            min-height: 100vh;
+            display: grid;
+            place-items: center;
+            background: #111827;
+            color: #f9fafb;
+            font-family: -apple-system, BlinkMacSystemFont,
+                         "Segoe UI", sans-serif;
+        }
+
+        .card {
+            width: min(460px, 92vw);
+            padding: 36px;
+            border: 1px solid #374151;
+            border-radius: 18px;
+            background: #1f2937;
+            text-align: center;
+        }
+
+        h1 {
+            margin: 0;
+            font-size: 34px;
+            letter-spacing: 3px;
+        }
+
+        .subtitle {
+            color: #9ca3af;
+            margin: 10px 0 32px;
+        }
+
+        #status {
+            margin-bottom: 20px;
+            font-weight: 600;
+        }
+
+        #timer {
+            font-size: 46px;
+            font-variant-numeric: tabular-nums;
+            font-weight: 600;
+        }
+
+        #remaining {
+            margin: 12px 0 30px;
+            color: #9ca3af;
+            font-size: 14px;
+        }
+
+        button {
+            width: 100%;
+            padding: 14px;
+            margin-top: 10px;
+            border: 0;
+            border-radius: 9px;
+            font-size: 15px;
+            font-weight: 600;
+            cursor: pointer;
+        }
+
+        button:disabled {
+            opacity: 0.5;
+            cursor: not-allowed;
+        }
+
+        .start { background: #10b981; color: #071b14; }
+        .stop  { background: #ef4444; color: white; }
+        .save  { background: #f3f4f6; color: #111827; }
+        .cancel { background: #374151; color: white; }
+
+        #message {
+            min-height: 24px;
+            margin-top: 20px;
+            color: #d1d5db;
+            font-size: 13px;
+            overflow-wrap: anywhere;
+        }
+
+        dialog {
+            width: min(420px, 90vw);
+            padding: 28px;
+            border: 1px solid #4b5563;
+            border-radius: 14px;
+            background: #1f2937;
+            color: white;
+        }
+
+        dialog::backdrop { background: #0009; }
+
+        dialog h2 { margin-top: 0; }
+        dialog p { color: #d1d5db; }
+
+        #historySection {
+            margin-top: 30px;
+            padding-top: 20px;
+            border-top: 1px solid #374151;
+            text-align: left;
+        }
+
+        #historySection h2 {
+            font-size: 18px;
+            margin-bottom: 15px;
+        }
+
+        #historyStatus {
+            color: #9ca3af;
+            font-size: 13px;
+        }
+
+        .sessionItem {
+            padding: 12px;
+            margin: 10px 0;
+            background: #111827;
+            border: 1px solid #374151;
+            border-radius: 8px;
+        }
+
+        .sessionName {
+            font-size: 12px;
+            overflow-wrap: anywhere;
+        }
+
+        .sessionDetails {
+            margin-top: 6px;
+            font-size: 12px;
+            color: #9ca3af;
+        }
+
+
+        #transcriptDialog {
+            width: min(850px, 94vw);
+            max-height: 85vh;
+            overflow-y: auto;
+        }
+
+        #transcriptContent {
+            white-space: pre-wrap;
+            overflow-wrap: anywhere;
+            text-align: start;
+            unicode-bidi: plaintext;
+            line-height: 1.8;
+            padding: 16px;
+            background: #111827;
+            border-radius: 8px;
+            max-height: 55vh;
+            overflow-y: auto;
+            font-family: inherit;
+            font-size: 14px;
+        }
+
+        .viewTranscriptButton {
+            background: #374151;
+            color: white;
+            font-size: 12px;
+            padding: 10px;
+        }
+
+
+        #processingDialog {
+            width: min(480px, 92vw);
+            max-height: 85vh;
+            overflow-y: auto;
+            text-align: left;
+        }
+
+        #processingSessionName {
+            font-size: 13px;
+            overflow-wrap: anywhere;
+            color: #9ca3af;
+        }
+
+        #processingMessage {
+            margin: 20px 0;
+            line-height: 1.6;
+        }
+
+        #processingDetails {
+            padding: 12px;
+            background: #111827;
+            border-radius: 8px;
+            margin-bottom: 20px;
+        }
+
+    </style>
+</head>
+
+<body>
+
+    <main class="card">
+        <h1>NILARIS</h1>
+        <p class="subtitle">Meeting Transcription Assistant</p>
+
+        <div id="status">Connecting...</div>
+        <div id="timer">00:00:00</div>
+        <div id="remaining">Maximum duration: 3 hours</div>
+
+        <button id="startButton" class="start" hidden>
+            Start Recording
+        </button>
+
+        <button id="stopButton" class="stop" hidden>
+            Stop Recording
+        </button>
+
+        <div id="message"></div>
+
+        <button id="confirmButton" class="start" hidden>
+            Confirm & Transcribe
+        </button>
+
+        <button id="deferButton" class="cancel" hidden>
+            Save for Later
+        </button>
+        <section id="historySection">
+            <h2>Saved Sessions</h2>
+            <p id="historyStatus">Loading sessions...</p>
+            <div id="sessionsList"></div>
+        </section>
+    </main>
+
+    <dialog id="transcriptDialog">
+        <h2>Meeting Transcript</h2>
+        <p id="transcriptSession"></p>
+        <pre id="transcriptContent"></pre>
+        <button id="closeTranscriptButton" class="cancel">
+            Close
+        </button>
+    </dialog>
+
+    <dialog id="processingDialog">
+        <h2>Session Transcription</h2>
+
+        <p id="processingSessionName"></p>
+
+        <div id="processingMessage">
+            Preparing session...
+        </div>
+
+        <div id="processingDetails" hidden>
+            <p>
+                Ready chunks:
+                <strong id="processingChunkCount">—</strong>
+            </p>
+
+            <p>
+                Estimated Whisper cost:
+                <strong id="processingCost">—</strong>
+            </p>
+        </div>
+
+        <button id="modalConfirmButton" class="start" hidden>
+            Confirm & Transcribe
+        </button>
+
+        <button id="modalDeferButton" class="cancel" hidden>
+            Save for Later
+        </button>
+
+        <button id="modalCloseButton" class="cancel">
+            Close
+        </button>
+    </dialog>
+
+    <dialog id="stopDialog">
+        <h2>End Recording?</h2>
+        <p>Choose what to do with your recording.</p>
+
+        <button id="transcribeButton" class="start">
+            Stop & Transcribe
+        </button>
+
+        <button id="saveButton" class="save">
+            Stop & Save Only
+        </button>
+
+        <button id="cancelButton" class="cancel">
+            Cancel — Keep Recording
+        </button>
+    </dialog>
+
+    <script>
+        const statusEl = document.getElementById("status");
+        const timerEl = document.getElementById("timer");
+        const remainingEl = document.getElementById("remaining");
+        const messageEl = document.getElementById("message");
+        const deferButton = document.getElementById("deferButton");
+        const confirmButton = document.getElementById("confirmButton");
+
+        let pendingSessionId = null;
+        let pendingEstimatedCost = null;
+
+        const startButton = document.getElementById("startButton");
+        const stopButton = document.getElementById("stopButton");
+        const saveButton = document.getElementById("saveButton");
+        const transcribeButton = document.getElementById("transcribeButton");
+        const cancelButton = document.getElementById("cancelButton");
+        const stopDialog = document.getElementById("stopDialog");
+
+        let busy = false;
+
+        function formatTime(seconds) {
+            const total = Math.max(0, Math.floor(seconds || 0));
+            const h = String(Math.floor(total / 3600)).padStart(2, "0");
+            const m = String(Math.floor(total % 3600 / 60)).padStart(2, "0");
+            const s = String(total % 60).padStart(2, "0");
+            return `${h}:${m}:${s}`;
+        }
+
+        async function refreshStatus() {
+            try {
+                const response = await fetch("/api/status", {
+                    cache: "no-store"
+                });
+
+                if (!response.ok) {
+                    throw new Error("Cannot read recorder status");
+                }
+
+                const data = await response.json();
+
+                statusEl.textContent = {
+                    idle: "Ready",
+                    starting: "Starting recorder...",
+                    recording: "● RECORDING",
+                    auto_stopped: "Recording automatically stopped",
+                    error: "Recorder error"
+                }[data.state] || data.state;
+
+                timerEl.textContent = formatTime(data.elapsed_seconds);
+
+                const max = data.max_duration_seconds || 10800;
+
+                remainingEl.textContent =
+                    data.state === "recording"
+                    ? `Remaining: ${formatTime(data.remaining_seconds)}`
+                    : `Maximum duration: ${formatTime(max)}`;
+
+                startButton.hidden =
+                    data.state !== "idle" &&
+                    data.state !== "auto_stopped";
+
+                stopButton.hidden = data.state !== "recording";
+
+                startButton.disabled = busy;
+                stopButton.disabled = busy;
+
+                if (data.state === "auto_stopped") {
+                    messageEl.textContent =
+                        "Recording saved automatically. No transcription started.";
+                }
+
+            } catch (error) {
+                statusEl.textContent = "Connection unavailable";
+                startButton.hidden = true;
+                stopButton.hidden = true;
+                messageEl.textContent = error.message;
+            }
+        }
+
+        async function postAction(path) {
+            const response = await fetch(path, {
+                method: "POST",
+                headers: { "Content-Type": "application/json" },
+                body: "{}"
+            });
+
+            const data = await response.json();
+
+            if (!response.ok) {
+                throw new Error(data.error || "Request failed");
+            }
+
+            return data;
+        }
+
+        startButton.onclick = async () => {
+            busy = true;
+            startButton.disabled = true;
+            messageEl.textContent = "Starting audio recorder...";
+
+            try {
+                await postAction("/api/recording/start");
+                messageEl.textContent = "Recording in progress.";
+            } catch (error) {
+                messageEl.textContent = error.message;
+            } finally {
+                busy = false;
+                await refreshStatus();
+            }
+        };
+
+        stopButton.onclick = () => {
+            stopDialog.showModal();
+        };
+
+        cancelButton.onclick = () => {
+            stopDialog.close();
+        };
+
+        transcribeButton.onclick = async () => {
+            busy = true;
+            transcribeButton.disabled = true;
+            saveButton.disabled = true;
+            messageEl.textContent = "Stopping and saving recording...";
+
+            try {
+                const recording = await postAction("/api/recording/stop");
+                stopDialog.close();
+
+                messageEl.textContent =
+                    "Recording saved. Preparing transcription...";
+
+                const preparation = await postAction(
+                    "/api/processing/prepare"
+                );
+
+                openProcessingDialog(preparation.session_id);
+                await refreshProcessingStatus();
+
+            } catch (error) {
+                messageEl.textContent = error.message;
+                stopDialog.close();
+            } finally {
+                busy = false;
+                transcribeButton.disabled = false;
+                saveButton.disabled = false;
+                await refreshStatus();
+                await refreshSessionHistory();
+            }
+        };
+
+        saveButton.onclick = async () => {
+            busy = true;
+            saveButton.disabled = true;
+            messageEl.textContent = "Stopping and saving...";
+
+            try {
+                const result = await postAction("/api/recording/stop");
+                stopDialog.close();
+                messageEl.textContent =
+                    `Recording saved: ${result.recording_path}`;
+            } catch (error) {
+                messageEl.textContent = error.message;
+            } finally {
+                busy = false;
+                saveButton.disabled = false;
+                await refreshStatus();
+                await refreshSessionHistory();
+            }
+        };
+
+        async function refreshProcessingStatus() {
+            try {
+                const response = await fetch("/api/processing/status", {
+                    cache: "no-store"
+                });
+
+                if (!response.ok) return;
+
+                const job = await response.json();
+
+                if (processingDialog.open && modalSessionId) {
+                    const details =
+                        document.getElementById("processingDetails");
+
+                    const modalConfirm =
+                        document.getElementById("modalConfirmButton");
+
+                    const modalDefer =
+                        document.getElementById("modalDeferButton");
+
+                    details.hidden = true;
+                    modalConfirm.hidden = true;
+                    modalDefer.hidden = true;
+
+                    if (job.session_id !== modalSessionId) {
+                        processingMessage.textContent =
+                            job.state === "idle" ||
+                            job.state === "deferred"
+                            ? "Select this session again to prepare it."
+                            : `Another session is active: ${job.session_id || "unknown"}`;
+
+                    } else if (job.state === "preparing") {
+                        processingMessage.textContent =
+                            "Preparing audio locally. Please wait...";
+
+                    } else if (
+                        job.state === "awaiting_confirmation" &&
+                        job.result
+                    ) {
+                        processingMessage.textContent =
+                            "Audio ready. Review the estimated cost.";
+
+                        document.getElementById(
+                            "processingChunkCount"
+                        ).textContent = job.result.ready_chunks;
+
+                        document.getElementById(
+                            "processingCost"
+                        ).textContent =
+                            `$${job.result.estimated_cost_usd}`;
+
+                        details.hidden = false;
+                        modalConfirm.hidden = false;
+                        modalDefer.hidden = false;
+
+                    } else if (job.state === "transcribing") {
+                        processingMessage.textContent =
+                            "Transcription in progress...";
+
+                    } else if (job.state === "completed") {
+                        processingMessage.textContent =
+                            "Transcription completed. Transcript saved locally.";
+
+                    } else if (job.state === "failed") {
+                        processingMessage.textContent =
+                            `Processing failed: ${job.error}`;
+
+                    } else if (job.state === "deferred") {
+                        processingMessage.textContent =
+                            "Recording saved for later.";
+                    }
+                }
+
+                if (job.state === "preparing") {
+                    messageEl.textContent =
+                        "Preparing audio locally. Please wait...";
+                }
+
+                if (job.state === "awaiting_confirmation" && job.result) {
+                    const result = job.result;
+
+                    const isNewlyPrepared =
+                        pendingSessionId !== job.session_id;
+
+                    pendingSessionId = job.session_id;
+                    pendingEstimatedCost = result.estimated_cost_usd;
+                    confirmButton.hidden = false;
+
+                    if (isNewlyPrepared) {
+                        confirmButton.scrollIntoView({
+                            behavior: "smooth",
+                            block: "center"
+                        });
+                    }
+                    deferButton.hidden = false;
+
+                    messageEl.textContent =
+                        `Session: ${job.session_id}. ` +
+                        `Audio ready: ${result.ready_chunks} chunk(s). ` +
+                        `Estimated Whisper cost: $${result.estimated_cost_usd}. ` +
+                        "No audio has been sent to OpenAI.";
+                }
+
+                if (job.state === "transcribing") {
+                    confirmButton.hidden = true;
+                    deferButton.hidden = true;
+                    pendingSessionId = null;
+                    pendingEstimatedCost = null;
+
+                    messageEl.textContent =
+                        `Transcribing session ${job.session_id}. ` +
+                        "Please wait. You may keep this tab open.";
+                }
+
+                if (job.state === "completed") {
+                    confirmButton.hidden = true;
+                    deferButton.hidden = true;
+                    pendingSessionId = null;
+                    pendingEstimatedCost = null;
+
+                    messageEl.textContent =
+                        `Transcription completed: ${job.session_id}. ` +
+                        "Transcript files have been saved locally.";
+                }
+
+                if (job.state === "deferred") {
+                    confirmButton.hidden = true;
+                    deferButton.hidden = true;
+                    pendingSessionId = null;
+                    messageEl.textContent =
+                        "Recording saved for later. No transcription started.";
+                }
+
+                if (job.state === "failed") {
+                    confirmButton.hidden = true;
+                    deferButton.hidden = true;
+                    pendingSessionId = null;
+                    pendingEstimatedCost = null;
+
+                    messageEl.textContent =
+                        `Processing failed: ${job.error}`;
+                }
+
+            } catch (error) {
+                console.error("Processing status unavailable:", error);
+            }
+        }
+
+        confirmButton.onclick = async () => {
+            if (!pendingSessionId || confirmButton.disabled) return;
+
+            const sessionId = pendingSessionId;
+            const estimatedCost = pendingEstimatedCost;
+
+            const approved = window.confirm(
+                `Confirm Whisper transcription?\n\n` +
+                `Session: ${sessionId}\n` +
+                `Estimated cost: $${estimatedCost}\n` +
+                `Allowed cost increase: less than $0.50\n\n` +
+                `The prepared audio will be sent to OpenAI.`
+            );
+
+            if (!approved) return;
+
+            confirmButton.disabled = true;
+            deferButton.disabled = true;
+            messageEl.textContent = "Submitting transcription approval...";
+
+            try {
+                const response = await fetch("/api/processing/confirm", {
+                    method: "POST",
+                    headers: {
+                        "Content-Type": "application/json"
+                    },
+                    body: JSON.stringify({
+                        session_id: sessionId
+                    })
+                });
+
+                const result = await response.json();
+
+                if (!response.ok) {
+                    throw new Error(result.error || "Confirmation failed");
+                }
+
+                confirmButton.hidden = true;
+                deferButton.hidden = true;
+                pendingSessionId = null;
+                pendingEstimatedCost = null;
+
+                messageEl.textContent =
+                    `Transcription started for ${result.session_id}.`;
+
+                await refreshProcessingStatus();
+
+            } catch (error) {
+                messageEl.textContent = error.message;
+                await refreshProcessingStatus();
+            } finally {
+                confirmButton.disabled = false;
+                deferButton.disabled = false;
+            }
+        };
+
+        deferButton.onclick = async () => {
+            if (!pendingSessionId) return;
+
+            deferButton.disabled = true;
+
+            try {
+                const response = await fetch("/api/processing/defer", {
+                    method: "POST",
+                    headers: {
+                        "Content-Type": "application/json"
+                    },
+                    body: JSON.stringify({
+                        session_id: pendingSessionId
+                    })
+                });
+
+                const result = await response.json();
+
+                if (!response.ok) {
+                    throw new Error(result.error || "Defer failed");
+                }
+
+                deferButton.hidden = true;
+                pendingSessionId = null;
+
+                messageEl.textContent =
+                    "Recording saved for later. No transcription started.";
+
+            } catch (error) {
+                messageEl.textContent = error.message;
+            } finally {
+                deferButton.disabled = false;
+            }
+        };
+
+        const transcriptDialog =
+            document.getElementById("transcriptDialog");
+
+        const transcriptContent =
+            document.getElementById("transcriptContent");
+
+        const transcriptSession =
+            document.getElementById("transcriptSession");
+
+        document.getElementById("closeTranscriptButton").onclick =
+            () => transcriptDialog.close();
+
+        async function viewTranscript(sessionId) {
+            transcriptSession.textContent = sessionId;
+            transcriptContent.textContent = "Loading transcript...";
+            transcriptDialog.showModal();
+
+            try {
+                const response = await fetch(
+                    `/api/sessions/${encodeURIComponent(sessionId)}/transcript`,
+                    { cache: "no-store" }
+                );
+
+                const data = await response.json();
+
+                if (!response.ok) {
+                    throw new Error(
+                        data.error || "Could not load transcript."
+                    );
+                }
+
+                transcriptContent.textContent = data.transcript;
+
+            } catch (error) {
+                transcriptContent.textContent = error.message;
+            }
+        }
+
+        const processingDialog =
+            document.getElementById("processingDialog");
+
+        const processingSessionName =
+            document.getElementById("processingSessionName");
+
+        const processingMessage =
+            document.getElementById("processingMessage");
+
+        document.getElementById("modalCloseButton").onclick = () => {
+            processingDialog.close();
+        };
+
+        let modalSessionId = null;
+
+        document.getElementById("modalDeferButton").onclick =
+            async () => {
+                const modalButton =
+                    document.getElementById("modalDeferButton");
+
+                if (modalButton.disabled || !modalSessionId) return;
+
+                modalButton.disabled = true;
+
+                try {
+                    const response = await fetch(
+                        "/api/processing/status",
+                        { cache: "no-store" }
+                    );
+
+                    if (!response.ok) {
+                        throw new Error("Cannot check session status.");
+                    }
+
+                    const job = await response.json();
+
+                    if (
+                        job.session_id !== modalSessionId ||
+                        job.state !== "awaiting_confirmation"
+                    ) {
+                        throw new Error(
+                            "Selected session is no longer awaiting confirmation."
+                        );
+                    }
+
+                    // Reuse the existing Save for Later handler.
+                    deferButton.click();
+
+                    processingMessage.textContent =
+                        "Saving session for later...";
+
+                } catch (error) {
+                    processingMessage.textContent = error.message;
+
+                } finally {
+                    modalButton.disabled = false;
+                }
+            };
+
+        document.getElementById("modalConfirmButton").onclick =
+            async () => {
+                const button =
+                    document.getElementById("modalConfirmButton");
+
+                if (button.disabled || !modalSessionId) return;
+
+                const sessionId = modalSessionId;
+                button.disabled = true;
+
+                try {
+                    const statusResponse = await fetch(
+                        "/api/processing/status",
+                        { cache: "no-store" }
+                    );
+
+                    if (!statusResponse.ok) {
+                        throw new Error("Cannot verify session status.");
+                    }
+
+                    const job = await statusResponse.json();
+
+                    if (
+                        job.session_id !== sessionId ||
+                        job.state !== "awaiting_confirmation" ||
+                        !job.result
+                    ) {
+                        throw new Error(
+                            "Session is no longer awaiting approval."
+                        );
+                    }
+
+                    // The user has reviewed the session and cost
+                    // in this modal. This click is the authorization.
+                    processingMessage.textContent =
+                        "Submitting transcription approval...";
+
+                    const response = await fetch(
+                        "/api/processing/confirm",
+                        {
+                            method: "POST",
+                            headers: {
+                                "Content-Type": "application/json"
+                            },
+                            body: JSON.stringify({
+                                session_id: sessionId
+                            })
+                        }
+                    );
+
+                    const result = await response.json();
+
+                    if (!response.ok) {
+                        throw new Error(
+                            result.error || "Transcription was not started."
+                        );
+                    }
+
+                    processingMessage.textContent =
+                        "Transcription started. Please wait...";
+
+                    await refreshProcessingStatus();
+
+                } catch (error) {
+                    processingMessage.textContent =
+                        error.message +
+                        " Check the session status before retrying.";
+
+                } finally {
+                    button.disabled = false;
+                }
+            };
+
+        function openProcessingDialog(sessionId) {
+            modalSessionId = sessionId;
+
+            processingSessionName.textContent =
+                `Session: ${sessionId}`;
+
+            processingMessage.textContent =
+                "Checking session and preparing audio...";
+
+            document.getElementById("processingDetails").hidden = true;
+            document.getElementById("modalConfirmButton").hidden = true;
+            document.getElementById("modalDeferButton").hidden = true;
+
+            if (!processingDialog.open) {
+                processingDialog.showModal();
+            }
+        }
+
+        function formatSessionDate(sessionId) {
+            const match = sessionId.match(
+                /^nilaris_(\d{4})-(\d{2})-(\d{2})T(\d{2})-(\d{2})-(\d{2})Z$/
+            );
+
+            if (!match) return sessionId;
+
+            const [, year, month, day, hour, minute, second] = match;
+
+            const date = new Date(
+                `${year}-${month}-${day}T${hour}:${minute}:${second}Z`
+            );
+
+            return new Intl.DateTimeFormat("en-GB", {
+                timeZone: "Europe/Berlin",
+                day: "2-digit",
+                month: "short",
+                year: "numeric",
+                hour: "2-digit",
+                minute: "2-digit",
+                hourCycle: "h23"
+            }).format(date);
+        }
+
+        async function refreshSessionHistory() {
+            const listEl = document.getElementById("sessionsList");
+            const historyStatus = document.getElementById("historyStatus");
+
+            try {
+                const response = await fetch("/api/sessions", {
+                    cache: "no-store"
+                });
+
+                if (!response.ok) {
+                    throw new Error("Could not load saved sessions.");
+                }
+
+                const data = await response.json();
+
+                listEl.replaceChildren();
+
+                historyStatus.textContent =
+                    `${data.sessions.length} saved session(s)`;
+
+                for (const session of data.sessions) {
+                    const item = document.createElement("div");
+                    item.className = "sessionItem";
+
+                    const name = document.createElement("div");
+                    name.className = "sessionName";
+                    name.textContent = formatSessionDate(
+                        session.session_id
+                    );
+
+                    const details = document.createElement("div");
+                    details.className = "sessionDetails";
+                    const duration =
+                        session.duration_seconds == null
+                        ? "Duration unavailable"
+                        : formatTime(
+                            Math.round(session.duration_seconds)
+                        );
+
+                    details.textContent =
+                        `${session.status.toUpperCase()} · ` +
+                        `${duration} · ` +
+                        `${session.recording_size_mb} MB`;
+
+                    item.append(name, details);
+
+                    if (session.has_transcript) {
+                        const button = document.createElement("button");
+                        button.className = "viewTranscriptButton";
+                        button.textContent = "View Transcript";
+
+                        button.onclick = () =>
+                            viewTranscript(session.session_id);
+
+                        item.appendChild(button);
+                    } else {
+                        const button = document.createElement("button");
+                        button.className = "viewTranscriptButton";
+                        button.textContent = "Prepare for Transcription";
+
+                        button.onclick = async () => {
+                            button.blur();
+                            openProcessingDialog(session.session_id);
+
+                            try {
+                                const response = await fetch(
+                                    "/api/processing/status",
+                                    { cache: "no-store" }
+                                );
+
+                                if (!response.ok) {
+                                    throw new Error("Cannot check processing status.");
+                                }
+
+                                const job = await response.json();
+
+                                if (job.state === "awaiting_confirmation") {
+                                    await refreshProcessingStatus();
+
+                                    if (job.session_id !== session.session_id) {
+                                        messageEl.textContent =
+                                            `Another session is awaiting confirmation: ` +
+                                            job.session_id;
+                                    }
+
+                                    
+                                    return;
+                                }
+
+                                if (
+                                    job.state === "preparing" ||
+                                    job.state === "transcribing"
+                                ) {
+                                    messageEl.textContent =
+                                        `Session ${job.session_id} is currently ` +
+                                        job.state + ".";
+
+                                    
+                                    return;
+                                }
+
+                            } catch (error) {
+                                messageEl.textContent = error.message;
+                                
+                                return;
+                            }
+
+                            button.disabled = true;
+                            button.textContent = "Preparing...";
+                            messageEl.textContent =
+                                `Preparing saved session: ${session.session_id}`;
+
+                            try {
+                                const response = await fetch(
+                                    `/api/sessions/${encodeURIComponent(session.session_id)}/prepare`,
+                                    { method: "POST" }
+                                );
+
+                                const result = await response.json();
+
+                                if (!response.ok) {
+                                    throw new Error(
+                                        result.error || "Preparation failed"
+                                    );
+                                }
+
+                                messageEl.textContent =
+                                    "Preparing audio locally. Please wait...";
+
+                                await refreshProcessingStatus();
+
+                                messageEl.scrollIntoView({
+                                    behavior: "smooth",
+                                    block: "center"
+                                });
+
+                            } catch (error) {
+                                messageEl.textContent = error.message;
+
+                                messageEl.scrollIntoView({
+                                    behavior: "smooth",
+                                    block: "center"
+                                });
+                            } finally {
+                                button.disabled = false;
+                                button.textContent = "Prepare for Transcription";
+                            }
+                        };
+
+                        item.appendChild(button);
+                    }
+
+                    listEl.appendChild(item);
+                }
+
+            } catch (error) {
+                historyStatus.textContent = error.message;
+            }
+        }
+
+        refreshStatus();
+        refreshProcessingStatus();
+        refreshSessionHistory();
+
+        setInterval(refreshStatus, 1000);
+        setInterval(refreshProcessingStatus, 2000);
+    </script>
+
+</body>
+</html>

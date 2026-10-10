@@ -1,0 +1,247 @@
+import subprocess
+import threading
+import time
+from datetime import datetime, timezone
+from pathlib import Path
+
+PROJECT_ROOT = Path(__file__).resolve().parent.parent
+RECORDINGS_DIR = PROJECT_ROOT / "recordings"
+SWIFT_RECORDER = PROJECT_ROOT / "src" / "native_recorder.swift"
+
+READY_SIGNAL = "NILARIS_READY"
+STARTUP_TIMEOUT = 60
+
+DEFAULT_MAX_RECORDING_SECONDS = 3 * 60 * 60
+ABSOLUTE_MAX_RECORDING_SECONDS = 9 * 60 * 60
+
+
+class RecordingController:
+    def __init__(self, max_duration_seconds=DEFAULT_MAX_RECORDING_SECONDS):
+        if not 0 < max_duration_seconds <= ABSOLUTE_MAX_RECORDING_SECONDS:
+            raise ValueError("Recording duration must be between 0 and 9 hours.")
+
+        self.max_duration_seconds = max_duration_seconds
+        self.process = None
+        self.started_at = None
+        self.started_monotonic = None
+        self.existing_files = set()
+
+        self.lock = threading.RLock()
+        self.ready_event = threading.Event()
+        self.output_lines = []
+
+        self.last_completed_recording = None
+        self.auto_stopped = False
+
+    def _read_output(self, process):
+        """Read Swift output continuously and detect recorder readiness."""
+        for line in process.stdout:
+            line = line.rstrip()
+            self.output_lines.append(line)
+
+            if line == READY_SIGNAL:
+                self.ready_event.set()
+            else:
+                print(f"[Swift] {line}", flush=True)
+
+    def start_recording(self):
+        with self.lock:
+            if self.process is not None:
+                raise RuntimeError("A recording is already active or unfinished.")
+
+            RECORDINGS_DIR.mkdir(exist_ok=True)
+
+            self.existing_files = set(
+                RECORDINGS_DIR.glob("nilaris_*.caf")
+            )
+
+            self.ready_event.clear()
+            self.output_lines = []
+            self.auto_stopped = False
+            self.last_completed_recording = None
+
+            process = subprocess.Popen(
+                ["swift", str(SWIFT_RECORDER)],
+                cwd=PROJECT_ROOT,
+                stdin=subprocess.PIPE,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+                text=True,
+                bufsize=1,
+            )
+
+            self.process = process
+
+            threading.Thread(
+                target=self._read_output,
+                args=(process,),
+                daemon=True,
+            ).start()
+
+        deadline = time.monotonic() + STARTUP_TIMEOUT
+
+        while time.monotonic() < deadline:
+            if self.ready_event.wait(timeout=0.2):
+                with self.lock:
+                    if self.process is process and process.poll() is None:
+                        self.started_at = datetime.now(timezone.utc)
+                        self.started_monotonic = time.monotonic()
+
+                        threading.Thread(
+                            target=self._recording_watchdog,
+                            args=(process,),
+                            daemon=True,
+                        ).start()
+
+                        return self.get_status()
+                break
+
+            if process.poll() is not None:
+                break
+
+        with self.lock:
+            if process.poll() is None:
+                try:
+                    process.stdin.write("STOP\n")
+                    process.stdin.flush()
+                    process.wait(timeout=10)
+                except (BrokenPipeError, OSError, subprocess.TimeoutExpired):
+                    if process.poll() is None:
+                        process.terminate()
+                        try:
+                            process.wait(timeout=5)
+                        except subprocess.TimeoutExpired:
+                            process.kill()
+                            process.wait()
+
+            if process.stdin:
+                process.stdin.close()
+
+            if self.process is process:
+                self.process = None
+                self.started_at = None
+                self.started_monotonic = None
+                self.ready_event.clear()
+
+        details = "\n".join(self.output_lines[-10:])
+        raise RuntimeError(
+            "Recorder startup failed or timed out.\n"
+            f"Recent Swift output:\n{details}"
+        )
+
+    def _recording_watchdog(self, process):
+        """Automatically stop and save at the recording duration limit."""
+        while True:
+            time.sleep(0.5)
+
+            with self.lock:
+                if self.process is not process:
+                    return
+
+                if process.poll() is not None:
+                    return
+
+                if self.started_monotonic is None:
+                    return
+
+                elapsed = time.monotonic() - self.started_monotonic
+
+                if elapsed < self.max_duration_seconds:
+                    continue
+
+                print("\nRecording limit reached. Auto-stopping...", flush=True)
+
+                try:
+                    result = self.stop_recording()
+                    self.auto_stopped = True
+                    self.last_completed_recording = result
+                    print("Recording automatically saved.", flush=True)
+                except Exception as error:
+                    print(f"Auto-stop failed: {error}", flush=True)
+
+                return
+
+    def get_status(self):
+        with self.lock:
+            if self.process is None:
+                return {
+                    "state": "auto_stopped" if self.auto_stopped else "idle",
+                    "elapsed_seconds": 0,
+                    "max_duration_seconds": self.max_duration_seconds,
+                    "last_completed_recording": self.last_completed_recording,
+                }
+
+            if self.process.poll() is not None:
+                state = "error"
+            elif self.ready_event.is_set():
+                state = "recording"
+            else:
+                state = "starting"
+
+            elapsed = (
+                max(0, time.monotonic() - self.started_monotonic)
+                if self.started_monotonic is not None
+                else 0
+            )
+
+            return {
+                "state": state,
+                "elapsed_seconds": round(elapsed, 1),
+                "remaining_seconds": round(
+                    max(0, self.max_duration_seconds - elapsed), 1
+                ),
+                "max_duration_seconds": self.max_duration_seconds,
+                "pid": self.process.pid,
+            }
+
+    def stop_recording(self):
+        with self.lock:
+            if self.process is None:
+                raise RuntimeError("No active recording.")
+
+            if not self.ready_event.is_set():
+                raise RuntimeError("Recorder is not ready.")
+
+            process = self.process
+
+            if process.poll() is not None:
+                raise RuntimeError("Recorder exited unexpectedly.")
+
+            process.stdin.write("STOP\n")
+            process.stdin.flush()
+
+            return_code = process.wait(timeout=30)
+            process.stdin.close()
+
+            if return_code != 0:
+                raise RuntimeError(
+                    f"Recorder exited with code {return_code}"
+                )
+
+            new_files = set(
+                RECORDINGS_DIR.glob("nilaris_*.caf")
+            ) - self.existing_files
+
+            if len(new_files) != 1:
+                raise RuntimeError(
+                    "Could not uniquely identify the new recording."
+                )
+
+            recording_path = new_files.pop()
+
+            result = {
+                "state": "completed",
+                "recording_path": str(recording_path),
+                "file_size_mb": round(
+                    recording_path.stat().st_size / 1024 / 1024, 2
+                ),
+            }
+
+            self.process = None
+            self.started_at = None
+            self.started_monotonic = None
+            self.existing_files = set()
+            self.ready_event.clear()
+            self.last_completed_recording = result
+
+            return result
