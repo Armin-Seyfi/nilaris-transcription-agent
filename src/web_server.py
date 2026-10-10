@@ -60,6 +60,15 @@ def stop_recording():
 
 
 
+@app.post("/api/recording/recover")
+def recover_recording():
+    try:
+        result = controller.acknowledge_recorder_error()
+        return jsonify(result)
+    except RuntimeError as error:
+        return jsonify({"error": str(error)}), 409
+
+
 @app.post("/api/processing/prepare")
 def prepare_recording():
     recording = controller.last_completed_recording

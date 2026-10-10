@@ -30,6 +30,11 @@ print("Sample Rate: \(format.sampleRate) Hz")
 print("Channels: \(format.channelCount)")
 print("Output: \(outputURL.path)")
 
+// Shared failure state between the audio callback and main thread.
+let failureLock = NSLock()
+var audioWriteFailure: String?
+let stopSemaphore = DispatchSemaphore(value: 0)
+
 input.installTap(
     onBus: 0,
     bufferSize: 1024,
@@ -38,7 +43,12 @@ input.installTap(
     do {
         try file.write(from: buffer)
     } catch {
-        print("Audio write error: \(error)")
+        failureLock.lock()
+        if audioWriteFailure == nil {
+            audioWriteFailure = String(describing: error)
+            stopSemaphore.signal()
+        }
+        failureLock.unlock()
     }
 }
 
@@ -56,8 +66,6 @@ let hardLimitSeconds: TimeInterval = 9 * 60 * 60
 let recordingStarted = Date()
 
 // Read STOP commands without blocking the safety timer.
-let stopSemaphore = DispatchSemaphore(value: 0)
-
 DispatchQueue.global(qos: .userInitiated).async {
     while let command = readLine() {
         if command.trimmingCharacters(in: .whitespacesAndNewlines)
@@ -79,6 +87,16 @@ if waitResult == .timedOut {
 
 input.removeTap(onBus: 0)
 engine.stop()
+
+failureLock.lock()
+let failure = audioWriteFailure
+failureLock.unlock()
+
+if let failure = failure {
+    print("NILARIS_AUDIO_WRITE_ERROR: \(failure)")
+    fflush(stdout)
+    exit(EXIT_FAILURE)
+}
 
 print("Recording stopped.")
 print("Saved: \(outputURL.path)")

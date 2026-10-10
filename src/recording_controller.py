@@ -1,4 +1,5 @@
 import subprocess
+from macos_notifications import notify_recording_failure
 import threading
 import time
 from datetime import datetime, timezone
@@ -31,7 +32,9 @@ class RecordingController:
         self.output_lines = []
 
         self.last_completed_recording = None
+        self.last_recovery = None
         self.auto_stopped = False
+        self.stop_requested = False
 
     def _read_output(self, process):
         """Read Swift output continuously and detect recorder readiness."""
@@ -58,6 +61,7 @@ class RecordingController:
             self.ready_event.clear()
             self.output_lines = []
             self.auto_stopped = False
+            self.stop_requested = False
             self.last_completed_recording = None
 
             process = subprocess.Popen(
@@ -139,6 +143,19 @@ class RecordingController:
                     return
 
                 if process.poll() is not None:
+                    if self.stop_requested:
+                        return
+
+                    print(
+                        "Recorder exited unexpectedly. Sending macOS alert.",
+                        flush=True,
+                    )
+
+                    threading.Thread(
+                        target=notify_recording_failure,
+                        daemon=True,
+                    ).start()
+
                     return
 
                 if self.started_monotonic is None:
@@ -171,7 +188,9 @@ class RecordingController:
                     "last_completed_recording": self.last_completed_recording,
                 }
 
-            if self.process.poll() is not None:
+            exit_code = self.process.poll()
+
+            if exit_code is not None:
                 state = "error"
             elif self.ready_event.is_set():
                 state = "recording"
@@ -192,7 +211,54 @@ class RecordingController:
                 ),
                 "max_duration_seconds": self.max_duration_seconds,
                 "pid": self.process.pid,
+                "error": (
+                    "Audio write failure"
+                    if state == "error" and any(
+                        "NILARIS_AUDIO_WRITE_ERROR" in line
+                        for line in self.output_lines
+                    )
+                    else "Recorder exited unexpectedly"
+                    if state == "error"
+                    else None
+                ),
+                "exit_code": exit_code,
             }
+
+    def acknowledge_recorder_error(self):
+        """Reset a crashed recorder without deleting any recording files."""
+        with self.lock:
+            if self.process is None or self.process.poll() is None:
+                raise RuntimeError("No stopped recorder to recover.")
+
+            exit_code = self.process.returncode
+
+            new_files = sorted(
+                set(RECORDINGS_DIR.glob("nilaris_*.caf"))
+                - self.existing_files
+            )
+
+            recovery_info = {
+                "state": "recovered",
+                "exit_code": exit_code,
+                "possible_recordings": [str(p) for p in new_files],
+                "message": (
+                    "Recorder state reset. Existing audio files were preserved "
+                    "but have not been validated."
+                ),
+            }
+
+            self.last_recovery = recovery_info
+
+            if self.process.stdin and not self.process.stdin.closed:
+                self.process.stdin.close()
+
+            self.process = None
+            self.started_at = None
+            self.started_monotonic = None
+            self.existing_files = set()
+            self.ready_event.clear()
+
+            return recovery_info
 
     def stop_recording(self):
         with self.lock:
@@ -207,6 +273,7 @@ class RecordingController:
             if process.poll() is not None:
                 raise RuntimeError("Recorder exited unexpectedly.")
 
+            self.stop_requested = True
             process.stdin.write("STOP\n")
             process.stdin.flush()
 

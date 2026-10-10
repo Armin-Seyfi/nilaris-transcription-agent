@@ -211,6 +211,10 @@
             Stop Recording
         </button>
 
+        <button id="recoverButton" class="stop" hidden>
+            Acknowledge & Recover
+        </button>
+
         <div id="message"></div>
 
 
@@ -290,6 +294,7 @@
 
         const startButton = document.getElementById("startButton");
         const stopButton = document.getElementById("stopButton");
+        const recoverButton = document.getElementById("recoverButton");
         const saveButton = document.getElementById("saveButton");
         const transcribeButton = document.getElementById("transcribeButton");
         const cancelButton = document.getElementById("cancelButton");
@@ -339,9 +344,18 @@
                     data.state !== "auto_stopped";
 
                 stopButton.hidden = data.state !== "recording";
+                recoverButton.hidden = data.state !== "error";
 
                 startButton.disabled = busy;
                 stopButton.disabled = busy;
+                recoverButton.disabled = busy;
+
+                if (data.state === "error") {
+                    messageEl.textContent =
+                        "Recording stopped unexpectedly. " +
+                        "Your audio may be incomplete. " +
+                        "Acknowledge the error to enable a new recording.";
+                }
 
                 if (data.state === "auto_stopped") {
                     messageEl.textContent =
@@ -385,6 +399,32 @@
             } finally {
                 busy = false;
                 await refreshStatus();
+            }
+        };
+
+        recoverButton.onclick = async () => {
+            if (busy) return;
+
+            busy = true;
+            recoverButton.disabled = true;
+            messageEl.textContent = "Recovering recorder state...";
+
+            try {
+                const result = await postAction("/api/recording/recover");
+
+                const count = (result.possible_recordings || []).length;
+
+                messageEl.textContent =
+                    "Recorder recovered. Existing audio files were preserved. " +
+                    count + " possible recording file(s) found. " +
+                    "Their integrity has not been verified.";
+
+            } catch (error) {
+                messageEl.textContent = error.message;
+            } finally {
+                busy = false;
+                await refreshStatus();
+                await refreshSessionHistory();
             }
         };
 
