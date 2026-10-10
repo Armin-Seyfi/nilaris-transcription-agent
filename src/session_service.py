@@ -1,6 +1,7 @@
 from pathlib import Path
 
 from audio_processor import process_recording
+from audio_completeness import validate_audio_completeness
 from session_metadata import create_session_metadata
 from transcription_orchestrator import inspect_session, PRICE_PER_MINUTE
 
@@ -43,6 +44,9 @@ def prepare_session(recording_path):
 
     if not metadata_path.exists():
         create_session_metadata(recording_path)
+
+    # Reject incomplete audio before offering paid transcription.
+    validate_audio_completeness(recording_path, session_dir)
 
     # Inspect chunks locally; no OpenAI API request is sent.
     ready_chunks = inspect_session(session_dir)
