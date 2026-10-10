@@ -802,6 +802,38 @@
             }).format(date);
         }
 
+        function getSessionMonth(sessionId) {
+            const match = sessionId.match(
+                /^nilaris_(\d{4})-(\d{2})-(\d{2})T(\d{2})-(\d{2})-(\d{2})Z$/
+            );
+
+            if (!match) return null;
+
+            const [, year, month, day, hour, minute, second] = match;
+
+            const date = new Date(
+                `${year}-${month}-${day}T${hour}:${minute}:${second}Z`
+            );
+
+            if (Number.isNaN(date.getTime())) return null;
+
+            const parts = new Intl.DateTimeFormat("en-GB", {
+                timeZone: "Europe/Berlin",
+                year: "numeric",
+                month: "2-digit"
+            }).formatToParts(date);
+
+            const values = Object.fromEntries(
+                parts.map(part => [part.type, part.value])
+            );
+
+            return {
+                year: Number(values.year),
+                month: Number(values.month),
+                key: `${values.year}-${values.month}`
+            };
+        }
+
         async function manageSessionStorage(sessionId, action, button) {
             button.disabled = true;
             const originalText = button.textContent;
@@ -848,10 +880,67 @@
 
                 const data = await response.json();
 
+                const previousGroupState = new Map(
+                    [...listEl.querySelectorAll("details[data-group-key]")]
+                        .map(group => [group.dataset.groupKey, group.open])
+                );
+
                 listEl.replaceChildren();
 
                 historyStatus.textContent =
                     `${data.sessions.length} saved session(s)`;
+
+                const berlinParts = new Intl.DateTimeFormat("en-GB", {
+                    timeZone: "Europe/Berlin",
+                    year: "numeric",
+                    month: "2-digit"
+                }).formatToParts(new Date());
+
+                const currentParts = Object.fromEntries(
+                    berlinParts.map(part => [part.type, part.value])
+                );
+
+                const currentYear = Number(currentParts.year);
+                const currentMonthKey =
+                    `${currentParts.year}-${currentParts.month}`;
+
+                const monthCounts = new Map();
+                const yearCounts = new Map();
+
+                for (const session of data.sessions) {
+                    const period = getSessionMonth(session.session_id);
+                    if (!period) continue;
+
+                    monthCounts.set(
+                        period.key,
+                        (monthCounts.get(period.key) || 0) + 1
+                    );
+
+                    yearCounts.set(
+                        period.year,
+                        (yearCounts.get(period.year) || 0) + 1
+                    );
+                }
+
+                const yearGroups = new Map();
+                const monthGroups = new Map();
+
+                function createHistoryGroup(key, label, parent, openByDefault) {
+                    const group = document.createElement("details");
+                    group.className = "sessionHistoryGroup";
+                    group.dataset.groupKey = key;
+
+                    group.open = previousGroupState.has(key)
+                        ? previousGroupState.get(key)
+                        : openByDefault;
+
+                    const title = document.createElement("summary");
+                    title.textContent = label;
+                    group.appendChild(title);
+                    parent.appendChild(group);
+
+                    return group;
+                }
 
                 for (const session of data.sessions) {
                     const item = document.createElement("div");
@@ -1043,7 +1132,55 @@
 
                     item.appendChild(manageMenu);
 
-                    listEl.appendChild(item);
+                    const period = getSessionMonth(session.session_id);
+
+                    if (!period) {
+                        listEl.appendChild(item);
+                        continue;
+                    }
+
+                    let monthGroup = monthGroups.get(period.key);
+
+                    if (!monthGroup) {
+                        let parent = listEl;
+
+                        if (period.year !== currentYear) {
+                            let yearGroup = yearGroups.get(period.year);
+
+                            if (!yearGroup) {
+                                yearGroup = createHistoryGroup(
+                                    `year:${period.year}`,
+                                    `${period.year} (${yearCounts.get(period.year)} sessions)`,
+                                    listEl,
+                                    false
+                                );
+                                yearGroups.set(period.year, yearGroup);
+                            }
+
+                            parent = yearGroup;
+                        }
+
+                        const monthDate = new Date(
+                            Date.UTC(period.year, period.month - 1, 15)
+                        );
+
+                        const monthLabel = new Intl.DateTimeFormat("en-GB", {
+                            timeZone: "Europe/Berlin",
+                            month: "long",
+                            year: "numeric"
+                        }).format(monthDate);
+
+                        monthGroup = createHistoryGroup(
+                            `month:${period.key}`,
+                            `${monthLabel} (${monthCounts.get(period.key)} sessions)`,
+                            parent,
+                            period.key === currentMonthKey
+                        );
+
+                        monthGroups.set(period.key, monthGroup);
+                    }
+
+                    monthGroup.appendChild(item);
                 }
 
             } catch (error) {
