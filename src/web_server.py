@@ -1,13 +1,39 @@
 from pathlib import Path
+import threading
+from functools import wraps
 from flask import Flask, jsonify, request, render_template
 from recording_controller import RecordingController
 from processing_manager import ProcessingManager
 from session_history import list_sessions
+from session_storage import remove_session_audio, trash_entire_session
 
 app = Flask(__name__)
 app.config["TEMPLATES_AUTO_RELOAD"] = True
 controller = RecordingController()
 processing_manager = ProcessingManager()
+
+
+
+operation_lock = threading.Lock()
+
+
+def coordinated_storage_operation(function):
+    """Prevent starts and storage changes from overlapping."""
+
+    @wraps(function)
+    def guarded(*args, **kwargs):
+        if not operation_lock.acquire(blocking=False):
+            return jsonify({
+                "error": "Another Nilaris operation is in progress. "
+                         "Please try again shortly."
+            }), 409
+
+        try:
+            return function(*args, **kwargs)
+        finally:
+            operation_lock.release()
+
+    return guarded
 
 
 @app.get("/")
@@ -29,7 +55,11 @@ def protect_recording_api():
         ))
         or (
             request.path.startswith("/api/sessions/")
-            and request.path.endswith("/prepare")
+            and request.path.endswith((
+                "/prepare",
+                "/remove-audio",
+                "/trash",
+            ))
         )
     ):
         if request.method != "POST":
@@ -42,6 +72,7 @@ def protect_recording_api():
 
 
 @app.post("/api/recording/start")
+@coordinated_storage_operation
 def start_recording():
     try:
         result = controller.start_recording()
@@ -70,6 +101,7 @@ def recover_recording():
 
 
 @app.post("/api/processing/prepare")
+@coordinated_storage_operation
 def prepare_recording():
     recording = controller.last_completed_recording
 
@@ -106,6 +138,7 @@ def defer_processing():
 
 
 @app.post("/api/processing/confirm")
+@coordinated_storage_operation
 def confirm_processing():
     data = request.get_json(silent=True) or {}
     session_id = data.get("session_id")
@@ -162,6 +195,7 @@ def get_session_transcript(session_id):
 
 
 @app.post("/api/sessions/<session_id>/prepare")
+@coordinated_storage_operation
 def prepare_saved_session(session_id):
     """Prepare an existing local recording without calling Whisper."""
 
@@ -193,6 +227,69 @@ def prepare_saved_session(session_id):
             session["recording_path"]
         )
         return jsonify(result), 202
+
+    except RuntimeError as error:
+        return jsonify({"error": str(error)}), 409
+
+
+
+def ensure_session_storage_available():
+    """Block storage changes while recording or processing is active."""
+
+    recording_state = controller.get_status().get("state")
+
+    if recording_state not in ("idle", "auto_stopped"):
+        raise RuntimeError(
+            "Stop or recover the recording before managing session files."
+        )
+
+    processing_state = processing_manager.get_status().get("state")
+
+    if processing_state in (
+        "preparing",
+        "awaiting_confirmation",
+        "transcribing",
+    ):
+        raise RuntimeError(
+            "Finish or defer the current processing job before deleting files."
+        )
+
+
+@app.post("/api/sessions/<session_id>/remove-audio")
+@coordinated_storage_operation
+def remove_saved_session_audio(session_id):
+    """Move session audio to macOS Trash, preserving the transcript."""
+
+    try:
+        ensure_session_storage_available()
+        result = remove_session_audio(session_id)
+        return jsonify(result)
+
+    except ValueError as error:
+        return jsonify({"error": str(error)}), 400
+
+    except FileNotFoundError as error:
+        return jsonify({"error": str(error)}), 404
+
+    except RuntimeError as error:
+        return jsonify({"error": str(error)}), 409
+
+
+@app.post("/api/sessions/<session_id>/trash")
+@coordinated_storage_operation
+def trash_saved_session(session_id):
+    """Move a complete saved session to macOS Trash."""
+
+    try:
+        ensure_session_storage_available()
+        result = trash_entire_session(session_id)
+        return jsonify(result)
+
+    except ValueError as error:
+        return jsonify({"error": str(error)}), 400
+
+    except FileNotFoundError as error:
+        return jsonify({"error": str(error)}), 404
 
     except RuntimeError as error:
         return jsonify({"error": str(error)}), 409

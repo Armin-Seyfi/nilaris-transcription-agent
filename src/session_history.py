@@ -66,44 +66,70 @@ def get_recording_duration(recording, metadata_path):
 
 
 def list_sessions():
-    """Return locally saved sessions, newest first."""
+    """Discover sessions from recordings and saved transcripts."""
+
+    recordings = {
+        path.stem: path
+        for path in RECORDINGS_DIR.glob("nilaris_*.caf")
+    } if RECORDINGS_DIR.exists() else {}
+
+    session_ids = set(recordings)
+
+    if OUTPUTS_DIR.exists():
+        for session_dir in OUTPUTS_DIR.glob("nilaris_*_separated"):
+            if not session_dir.is_dir():
+                continue
+
+            session_id = session_dir.name.removesuffix("_separated")
+
+            transcript_txt = session_dir / "transcript.txt"
+            transcript_json = session_dir / "transcript.json"
+
+            if transcript_txt.is_file() and transcript_json.is_file():
+                session_ids.add(session_id)
 
     sessions = []
 
-    if not RECORDINGS_DIR.exists():
-        return sessions
-
-    for recording in RECORDINGS_DIR.glob("nilaris_*.caf"):
-
-        session_id = recording.stem
+    for session_id in session_ids:
+        recording = recordings.get(session_id)
         session_dir = OUTPUTS_DIR / f"{session_id}_separated"
 
         transcript_txt = session_dir / "transcript.txt"
         transcript_json = session_dir / "transcript.json"
         metadata = session_dir / "session_metadata.json"
 
-        if transcript_txt.is_file() and transcript_json.is_file():
+        has_audio = recording is not None
+        has_transcript = (
+            transcript_txt.is_file()
+            and transcript_json.is_file()
+        )
+
+        if has_transcript:
             status = "transcribed"
         elif session_dir.is_dir():
             status = "prepared"
         else:
             status = "saved"
 
+        if has_audio:
+            duration = get_recording_duration(recording, metadata)
+            size_mb = round(recording.stat().st_size / (1024 * 1024), 2)
+        else:
+            duration = get_recording_duration(
+                RECORDINGS_DIR / f"{session_id}.caf",
+                metadata
+            )
+            size_mb = 0
+
         sessions.append({
             "session_id": session_id,
             "status": status,
-            "recording_path": str(recording),
-            "duration_seconds": get_recording_duration(
-                recording, metadata
-            ),
-            "recording_size_mb": round(
-                recording.stat().st_size / (1024 * 1024), 2
-            ),
+            "recording_path": str(recording) if has_audio else None,
+            "duration_seconds": duration,
+            "recording_size_mb": size_mb,
+            "has_audio": has_audio,
             "has_metadata": metadata.is_file(),
-            "has_transcript": (
-                transcript_txt.is_file()
-                and transcript_json.is_file()
-            ),
+            "has_transcript": has_transcript,
         })
 
     sessions.sort(

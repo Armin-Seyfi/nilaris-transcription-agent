@@ -802,6 +802,37 @@
             }).format(date);
         }
 
+        async function manageSessionStorage(sessionId, action, button) {
+            button.disabled = true;
+            const originalText = button.textContent;
+            button.textContent = "Moving to Trash...";
+
+            try {
+                const response = await fetch(
+                    `/api/sessions/${encodeURIComponent(sessionId)}/${action}`,
+                    { method: "POST" }
+                );
+
+                const result = await response.json();
+
+                if (!response.ok) {
+                    throw new Error(result.error || "Storage operation failed.");
+                }
+
+                messageEl.textContent =
+                    `${result.items_moved} item(s) moved to macOS Trash. ` +
+                    "Empty Trash to reclaim disk space.";
+
+                await refreshSessionHistory();
+
+            } catch (error) {
+                messageEl.textContent = error.message;
+            } finally {
+                button.disabled = false;
+                button.textContent = originalText;
+            }
+        }
+
         async function refreshSessionHistory() {
             const listEl = document.getElementById("sessionsList");
             const historyStatus = document.getElementById("historyStatus");
@@ -953,6 +984,64 @@
 
                         item.appendChild(button);
                     }
+
+                    const manageMenu = document.createElement("details");
+                    manageMenu.className = "sessionManageMenu";
+
+                    const manageTitle = document.createElement("summary");
+                    manageTitle.textContent = "Manage Session";
+                    manageMenu.appendChild(manageTitle);
+
+                    if (session.has_transcript && session.has_audio) {
+                        const removeAudio = document.createElement("button");
+                        removeAudio.type = "button";
+                        removeAudio.textContent =
+                            "Keep Transcript, Remove Audio";
+                        removeAudio.onclick = async () => {
+                            const confirmed = window.confirm(
+                                "Keep the transcript and move this session's " +
+                                "audio files to macOS Trash?\n\n" +
+                                "The transcript will remain available. " +
+                                "To reclaim disk space, empty macOS Trash."
+                            );
+
+                            if (!confirmed) return;
+
+                            await manageSessionStorage(
+                                session.session_id,
+                                "remove-audio",
+                                removeAudio
+                            );
+                        };
+                        manageMenu.appendChild(removeAudio);
+                    }
+
+                    const trashSession = document.createElement("button");
+                    trashSession.type = "button";
+                    trashSession.textContent = "Move Entire Session to Trash";
+                    trashSession.onclick = async () => {
+                        const warning = session.has_transcript
+                            ? "Move this entire session, including its " +
+                              "transcript and audio, to macOS Trash?"
+                            : "This session has NOT been transcribed. " +
+                              "Moving it to Trash will remove the original " +
+                              "audio without a saved transcript.\n\n" +
+                              "Are you sure you want to continue?";
+
+                        if (!window.confirm(
+                            warning + "\n\nYou can recover files from " +
+                            "Trash until it is emptied."
+                        )) return;
+
+                        await manageSessionStorage(
+                            session.session_id,
+                            "trash",
+                            trashSession
+                        );
+                    };
+                    manageMenu.appendChild(trashSession);
+
+                    item.appendChild(manageMenu);
 
                     listEl.appendChild(item);
                 }
