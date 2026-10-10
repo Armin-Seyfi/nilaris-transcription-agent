@@ -213,13 +213,7 @@
 
         <div id="message"></div>
 
-        <button id="confirmButton" class="start" hidden>
-            Confirm & Transcribe
-        </button>
 
-        <button id="deferButton" class="cancel" hidden>
-            Save for Later
-        </button>
         <section id="historySection">
             <h2>Saved Sessions</h2>
             <p id="historyStatus">Loading sessions...</p>
@@ -292,11 +286,7 @@
         const timerEl = document.getElementById("timer");
         const remainingEl = document.getElementById("remaining");
         const messageEl = document.getElementById("message");
-        const deferButton = document.getElementById("deferButton");
-        const confirmButton = document.getElementById("confirmButton");
 
-        let pendingSessionId = null;
-        let pendingEstimatedCost = null;
 
         const startButton = document.getElementById("startButton");
         const stopButton = document.getElementById("stopButton");
@@ -460,9 +450,10 @@
 
         async function refreshProcessingStatus() {
             try {
-                const response = await fetch("/api/processing/status", {
-                    cache: "no-store"
-                });
+                const response = await fetch(
+                    "/api/processing/status",
+                    { cache: "no-store" }
+                );
 
                 if (!response.ok) return;
 
@@ -531,171 +522,12 @@
                     }
                 }
 
-                if (job.state === "preparing") {
-                    messageEl.textContent =
-                        "Preparing audio locally. Please wait...";
-                }
-
-                if (job.state === "awaiting_confirmation" && job.result) {
-                    const result = job.result;
-
-                    const isNewlyPrepared =
-                        pendingSessionId !== job.session_id;
-
-                    pendingSessionId = job.session_id;
-                    pendingEstimatedCost = result.estimated_cost_usd;
-                    confirmButton.hidden = false;
-
-                    if (isNewlyPrepared) {
-                        confirmButton.scrollIntoView({
-                            behavior: "smooth",
-                            block: "center"
-                        });
-                    }
-                    deferButton.hidden = false;
-
-                    messageEl.textContent =
-                        `Session: ${job.session_id}. ` +
-                        `Audio ready: ${result.ready_chunks} chunk(s). ` +
-                        `Estimated Whisper cost: $${result.estimated_cost_usd}. ` +
-                        "No audio has been sent to OpenAI.";
-                }
-
-                if (job.state === "transcribing") {
-                    confirmButton.hidden = true;
-                    deferButton.hidden = true;
-                    pendingSessionId = null;
-                    pendingEstimatedCost = null;
-
-                    messageEl.textContent =
-                        `Transcribing session ${job.session_id}. ` +
-                        "Please wait. You may keep this tab open.";
-                }
-
-                if (job.state === "completed") {
-                    confirmButton.hidden = true;
-                    deferButton.hidden = true;
-                    pendingSessionId = null;
-                    pendingEstimatedCost = null;
-
-                    messageEl.textContent =
-                        `Transcription completed: ${job.session_id}. ` +
-                        "Transcript files have been saved locally.";
-                }
-
-                if (job.state === "deferred") {
-                    confirmButton.hidden = true;
-                    deferButton.hidden = true;
-                    pendingSessionId = null;
-                    messageEl.textContent =
-                        "Recording saved for later. No transcription started.";
-                }
-
-                if (job.state === "failed") {
-                    confirmButton.hidden = true;
-                    deferButton.hidden = true;
-                    pendingSessionId = null;
-                    pendingEstimatedCost = null;
-
-                    messageEl.textContent =
-                        `Processing failed: ${job.error}`;
-                }
-
             } catch (error) {
-                console.error("Processing status unavailable:", error);
+                console.error(
+                    "Processing status unavailable:", error
+                );
             }
         }
-
-        confirmButton.onclick = async () => {
-            if (!pendingSessionId || confirmButton.disabled) return;
-
-            const sessionId = pendingSessionId;
-            const estimatedCost = pendingEstimatedCost;
-
-            const approved = window.confirm(
-                `Confirm Whisper transcription?\n\n` +
-                `Session: ${sessionId}\n` +
-                `Estimated cost: $${estimatedCost}\n` +
-                `Allowed cost increase: less than $0.50\n\n` +
-                `The prepared audio will be sent to OpenAI.`
-            );
-
-            if (!approved) return;
-
-            confirmButton.disabled = true;
-            deferButton.disabled = true;
-            messageEl.textContent = "Submitting transcription approval...";
-
-            try {
-                const response = await fetch("/api/processing/confirm", {
-                    method: "POST",
-                    headers: {
-                        "Content-Type": "application/json"
-                    },
-                    body: JSON.stringify({
-                        session_id: sessionId
-                    })
-                });
-
-                const result = await response.json();
-
-                if (!response.ok) {
-                    throw new Error(result.error || "Confirmation failed");
-                }
-
-                confirmButton.hidden = true;
-                deferButton.hidden = true;
-                pendingSessionId = null;
-                pendingEstimatedCost = null;
-
-                messageEl.textContent =
-                    `Transcription started for ${result.session_id}.`;
-
-                await refreshProcessingStatus();
-
-            } catch (error) {
-                messageEl.textContent = error.message;
-                await refreshProcessingStatus();
-            } finally {
-                confirmButton.disabled = false;
-                deferButton.disabled = false;
-            }
-        };
-
-        deferButton.onclick = async () => {
-            if (!pendingSessionId) return;
-
-            deferButton.disabled = true;
-
-            try {
-                const response = await fetch("/api/processing/defer", {
-                    method: "POST",
-                    headers: {
-                        "Content-Type": "application/json"
-                    },
-                    body: JSON.stringify({
-                        session_id: pendingSessionId
-                    })
-                });
-
-                const result = await response.json();
-
-                if (!response.ok) {
-                    throw new Error(result.error || "Defer failed");
-                }
-
-                deferButton.hidden = true;
-                pendingSessionId = null;
-
-                messageEl.textContent =
-                    "Recording saved for later. No transcription started.";
-
-            } catch (error) {
-                messageEl.textContent = error.message;
-            } finally {
-                deferButton.disabled = false;
-            }
-        };
 
         const transcriptDialog =
             document.getElementById("transcriptDialog");
@@ -780,11 +612,32 @@
                         );
                     }
 
-                    // Reuse the existing Save for Later handler.
-                    deferButton.click();
+                    // Defer this exact session through the existing API.
+                    const deferResponse = await fetch(
+                        "/api/processing/defer",
+                        {
+                            method: "POST",
+                            headers: {
+                                "Content-Type": "application/json"
+                            },
+                            body: JSON.stringify({
+                                session_id: modalSessionId
+                            })
+                        }
+                    );
+
+                    const deferResult = await deferResponse.json();
+
+                    if (!deferResponse.ok) {
+                        throw new Error(
+                            deferResult.error || "Could not save session."
+                        );
+                    }
 
                     processingMessage.textContent =
-                        "Saving session for later...";
+                        "Recording saved for later.";
+
+                    await refreshProcessingStatus();
 
                 } catch (error) {
                     processingMessage.textContent = error.message;
