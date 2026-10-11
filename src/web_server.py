@@ -8,6 +8,7 @@ from flask import Flask, jsonify, request, render_template, send_file
 from recording_controller import RecordingController
 from processing_manager import ProcessingManager
 from session_history import list_sessions
+from app_paths import OUTPUTS_DIR
 from session_storage import remove_session_audio, trash_entire_session
 
 app = Flask(__name__)
@@ -180,10 +181,8 @@ def get_session_transcript(session_id):
     ):
         return jsonify({"error": "Invalid session ID."}), 400
 
-    project_root = Path(__file__).resolve().parent.parent
     transcript_path = (
-        project_root
-        / "outputs"
+        OUTPUTS_DIR
         / f"{session_id}_separated"
         / "transcript.txt"
     )
@@ -209,8 +208,7 @@ def download_session_txt(session_id):
     ):
         return jsonify({"error": "Invalid session ID."}), 400
 
-    project_root = Path(__file__).resolve().parent.parent
-    session_dir = project_root / "outputs" / f"{session_id}_separated"
+    session_dir = OUTPUTS_DIR / f"{session_id}_separated"
     transcript_path = session_dir / "transcript.txt"
 
     if session_dir.is_symlink() or transcript_path.is_symlink():
@@ -243,8 +241,7 @@ def download_session_docx(session_id):
     if language not in ("fa", "en"):
         return jsonify({"error": "Invalid document language."}), 400
 
-    root = Path(__file__).resolve().parent.parent
-    outputs_root = root / "outputs"
+    outputs_root = OUTPUTS_DIR
     folder = outputs_root / f"{session_id}_separated"
     transcript_path = folder / "transcript.json"
     metadata_path = folder / "session_metadata.json"

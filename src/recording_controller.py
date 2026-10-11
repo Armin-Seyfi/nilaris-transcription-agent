@@ -5,8 +5,7 @@ import time
 from datetime import datetime, timezone
 from pathlib import Path
 
-PROJECT_ROOT = Path(__file__).resolve().parent.parent
-RECORDINGS_DIR = PROJECT_ROOT / "recordings"
+from app_paths import PROJECT_ROOT, DATA_ROOT, RECORDINGS_DIR
 SWIFT_RECORDER = PROJECT_ROOT / "src" / "native_recorder.swift"
 
 READY_SIGNAL = "NILARIS_READY"
@@ -66,7 +65,7 @@ class RecordingController:
 
             process = subprocess.Popen(
                 ["swift", str(SWIFT_RECORDER)],
-                cwd=PROJECT_ROOT,
+                cwd=DATA_ROOT,
                 stdin=subprocess.PIPE,
                 stdout=subprocess.PIPE,
                 stderr=subprocess.STDOUT,

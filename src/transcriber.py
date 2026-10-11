@@ -7,6 +7,7 @@ from pathlib import Path
 from dotenv import load_dotenv
 from openai import OpenAI
 
+from app_paths import OUTPUTS_DIR
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 load_dotenv(PROJECT_ROOT / ".env")
 
@@ -42,7 +43,7 @@ def transcribe(audio_path, send=False):
     if not os.getenv("OPENAI_API_KEY"):
         raise RuntimeError("OPENAI_API_KEY is not configured.")
 
-    output_dir = PROJECT_ROOT / "outputs" / "transcription_tests"
+    output_dir = OUTPUTS_DIR / "transcription_tests"
     output_dir.mkdir(parents=True, exist_ok=True)
 
     json_path = output_dir / f"{audio_path.stem}.json"

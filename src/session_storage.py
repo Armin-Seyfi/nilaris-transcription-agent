@@ -4,9 +4,7 @@ import re
 from pathlib import Path
 
 
-PROJECT_ROOT = Path(__file__).resolve().parent.parent
-RECORDINGS_DIR = PROJECT_ROOT / "recordings"
-OUTPUTS_DIR = PROJECT_ROOT / "outputs"
+from app_paths import RECORDINGS_DIR, OUTPUTS_DIR
 
 SESSION_ID_PATTERN = re.compile(
     r"nilaris_\d{4}-\d{2}-\d{2}T\d{2}-\d{2}-\d{2}Z"

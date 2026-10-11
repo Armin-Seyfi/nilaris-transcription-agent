@@ -1,8 +1,7 @@
 from pathlib import Path
 import subprocess
 
-PROJECT_ROOT = Path(__file__).resolve().parent.parent
-RECORDINGS_DIR = PROJECT_ROOT / "recordings"
+from app_paths import PROJECT_ROOT, DATA_ROOT, RECORDINGS_DIR
 SWIFT_RECORDER = PROJECT_ROOT / "src" / "native_recorder.swift"
 
 
@@ -20,7 +19,7 @@ def record_meeting():
 
     process = subprocess.Popen(
         ["swift", str(SWIFT_RECORDER)],
-        cwd=PROJECT_ROOT,
+        cwd=DATA_ROOT,
         stdin=subprocess.PIPE,
     )
 

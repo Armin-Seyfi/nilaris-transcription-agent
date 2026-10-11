@@ -6,9 +6,9 @@ from session_metadata import create_session_metadata
 from transcription_orchestrator import inspect_session, PRICE_PER_MINUTE
 
 
-PROJECT_ROOT = Path(__file__).resolve().parent.parent
-RECORDINGS_DIR = (PROJECT_ROOT / "recordings").resolve()
-OUTPUTS_DIR = PROJECT_ROOT / "outputs"
+from app_paths import RECORDINGS_DIR as DATA_RECORDINGS_DIR, OUTPUTS_DIR
+
+RECORDINGS_DIR = DATA_RECORDINGS_DIR.resolve()
 
 
 def prepare_session(recording_path):

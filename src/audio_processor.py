@@ -2,8 +2,7 @@ from pathlib import Path
 import subprocess
 import sys
 
-PROJECT_ROOT = Path(__file__).resolve().parent.parent
-OUTPUT_DIR = PROJECT_ROOT / "outputs"
+from app_paths import OUTPUTS_DIR as OUTPUT_DIR
 
 
 def process_recording(recording_path, chunk_seconds=300):

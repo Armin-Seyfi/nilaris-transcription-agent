@@ -6,9 +6,7 @@ import subprocess
 from pathlib import Path
 
 
-PROJECT_ROOT = Path(__file__).resolve().parent.parent
-RECORDINGS_DIR = PROJECT_ROOT / "recordings"
-OUTPUTS_DIR = PROJECT_ROOT / "outputs"
+from app_paths import RECORDINGS_DIR, OUTPUTS_DIR
 
 
 def get_recording_duration(recording, metadata_path):
