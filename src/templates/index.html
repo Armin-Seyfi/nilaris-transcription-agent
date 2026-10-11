@@ -190,6 +190,57 @@
             margin-bottom: 20px;
         }
 
+
+        #transcriptDownloads:not([hidden]) {
+            display: flex;
+            flex-wrap: wrap;
+            gap: 10px;
+            margin: 18px 0 12px;
+        }
+
+        #transcriptDownloads button {
+            flex: 1 1 150px;
+            width: auto;
+            margin: 0;
+            padding: 11px 14px;
+            background: #374151;
+            color: #f9fafb;
+            font-size: 13px;
+            font-weight: 600;
+        }
+
+        #transcriptDownloads button:hover {
+            background: #4b5563;
+        }
+
+
+        /* Keep the transcript dialog stable for long meetings. */
+        #transcriptDialog[open] {
+            display: flex;
+            flex-direction: column;
+            height: min(720px, 85dvh);
+            max-height: 85dvh;
+            box-sizing: border-box;
+            overflow: hidden;
+        }
+
+        /* Only the transcript text should scroll. */
+        #transcriptDialog #transcriptContent {
+            flex: 1 1 auto;
+            min-height: 0;
+            max-height: none;
+            overflow-y: auto;
+            overflow-x: auto;
+        }
+
+        /* Keep session information and action buttons visible. */
+        #transcriptDialog h2,
+        #transcriptDialog #transcriptSession,
+        #transcriptDialog #transcriptDownloads,
+        #transcriptDialog #closeTranscriptButton {
+            flex-shrink: 0;
+        }
+
     </style>
 </head>
 
@@ -229,6 +280,19 @@
         <h2>Meeting Transcript</h2>
         <p id="transcriptSession"></p>
         <pre id="transcriptContent"></pre>
+
+        <div id="transcriptDownloads" hidden>
+            <button type="button" id="downloadTxtButton">
+                Download TXT
+            </button>
+            <button type="button" id="downloadWordFaButton">
+                Word فارسی
+            </button>
+            <button type="button" id="downloadWordEnButton">
+                Word English
+            </button>
+        </div>
+
         <button id="closeTranscriptButton" class="cancel">
             Close
         </button>
@@ -581,7 +645,39 @@
         document.getElementById("closeTranscriptButton").onclick =
             () => transcriptDialog.close();
 
+        const transcriptDownloads =
+            document.getElementById("transcriptDownloads");
+
+        let activeTranscriptSessionId = null;
+
+        function downloadTranscript(format, language = null) {
+            if (!activeTranscriptSessionId) return;
+
+            const sessionId = encodeURIComponent(
+                activeTranscriptSessionId
+            );
+
+            let url = `/api/sessions/${sessionId}/download/${format}`;
+
+            if (language) {
+                url += `?language=${encodeURIComponent(language)}`;
+            }
+
+            window.location.href = url;
+        }
+
+        document.getElementById("downloadTxtButton").onclick =
+            () => downloadTranscript("txt");
+
+        document.getElementById("downloadWordFaButton").onclick =
+            () => downloadTranscript("docx", "fa");
+
+        document.getElementById("downloadWordEnButton").onclick =
+            () => downloadTranscript("docx", "en");
+
         async function viewTranscript(sessionId) {
+            activeTranscriptSessionId = null;
+            transcriptDownloads.hidden = true;
             transcriptSession.textContent = sessionId;
             transcriptContent.textContent = "Loading transcript...";
             transcriptDialog.showModal();
@@ -601,6 +697,8 @@
                 }
 
                 transcriptContent.textContent = data.transcript;
+                activeTranscriptSessionId = sessionId;
+                transcriptDownloads.hidden = false;
 
             } catch (error) {
                 transcriptContent.textContent = error.message;

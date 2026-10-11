@@ -1,7 +1,10 @@
 from pathlib import Path
+import json
+from io import BytesIO
+from transcript_exporter import create_transcript_docx
 import threading
 from functools import wraps
-from flask import Flask, jsonify, request, render_template
+from flask import Flask, jsonify, request, render_template, send_file
 from recording_controller import RecordingController
 from processing_manager import ProcessingManager
 from session_history import list_sessions
@@ -192,6 +195,97 @@ def get_session_transcript(session_id):
         "session_id": session_id,
         "transcript": transcript_path.read_text(encoding="utf-8"),
     })
+
+
+@app.get("/api/sessions/<session_id>/download/txt")
+def download_session_txt(session_id):
+    """Download the original transcript without modifying it."""
+
+    import re
+
+    if not re.fullmatch(
+        r"nilaris_\d{4}-\d{2}-\d{2}T\d{2}-\d{2}-\d{2}Z",
+        session_id,
+    ):
+        return jsonify({"error": "Invalid session ID."}), 400
+
+    project_root = Path(__file__).resolve().parent.parent
+    session_dir = project_root / "outputs" / f"{session_id}_separated"
+    transcript_path = session_dir / "transcript.txt"
+
+    if session_dir.is_symlink() or transcript_path.is_symlink():
+        return jsonify({"error": "Unsafe transcript path."}), 400
+
+    if not transcript_path.is_file():
+        return jsonify({"error": "Transcript not found."}), 404
+
+    return send_file(
+        transcript_path,
+        mimetype="text/plain; charset=utf-8",
+        as_attachment=True,
+        download_name=f"{session_id}_transcript.txt",
+    )
+
+
+@app.get("/api/sessions/<session_id>/download/docx")
+def download_session_docx(session_id):
+    """Generate a Word document from the saved transcript."""
+
+    import re
+
+    if not re.fullmatch(
+        r"nilaris_\d{4}-\d{2}-\d{2}T\d{2}-\d{2}-\d{2}Z",
+        session_id,
+    ):
+        return jsonify({"error": "Invalid session ID."}), 400
+
+    language = request.args.get("language", "fa")
+    if language not in ("fa", "en"):
+        return jsonify({"error": "Invalid document language."}), 400
+
+    root = Path(__file__).resolve().parent.parent
+    outputs_root = root / "outputs"
+    folder = outputs_root / f"{session_id}_separated"
+    transcript_path = folder / "transcript.json"
+    metadata_path = folder / "session_metadata.json"
+
+    if any(
+        path.is_symlink()
+        for path in (outputs_root, folder, transcript_path, metadata_path)
+    ):
+        return jsonify({"error": "Unsafe transcript path."}), 400
+
+    if not transcript_path.is_file() or not metadata_path.is_file():
+        return jsonify({"error": "Transcript data not found."}), 404
+
+    try:
+        transcript = json.loads(
+            transcript_path.read_text(encoding="utf-8")
+        )
+        metadata = json.loads(
+            metadata_path.read_text(encoding="utf-8")
+        )
+
+        content = create_transcript_docx(
+            transcript,
+            metadata,
+            language=language,
+        )
+
+    except (ValueError, KeyError, TypeError) as error:
+        return jsonify({
+            "error": f"Cannot generate Word document: {error}"
+        }), 422
+
+    return send_file(
+        BytesIO(content),
+        mimetype=(
+            "application/vnd.openxmlformats-officedocument."
+            "wordprocessingml.document"
+        ),
+        as_attachment=True,
+        download_name=f"{session_id}_transcript_{language}.docx",
+    )
 
 
 @app.post("/api/sessions/<session_id>/prepare")
