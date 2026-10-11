@@ -3,9 +3,13 @@
 set -u
 
 PROJECT_DIR="$(cd "$(dirname "$0")" && pwd)"
+
+# Store persistent user data outside the application code directory.
+export NILARIS_DATA_DIR="$HOME/Library/Application Support/Nilaris"
+
 PYTHON="$PROJECT_DIR/.venv/bin/python"
 SERVER="$PROJECT_DIR/src/web_server.py"
-LOG_DIR="$PROJECT_DIR/logs"
+LOG_DIR="$HOME/Library/Logs/Nilaris"
 LOG_FILE="$LOG_DIR/nilaris-server.log"
 URL="http://127.0.0.1:8765"
 HEALTH_URL="$URL/api/health"
