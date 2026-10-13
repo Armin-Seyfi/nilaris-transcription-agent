@@ -287,12 +287,8 @@
             <button type="button" id="downloadTxtButton">
                 Download TXT
             </button>
-            <button type="button" id="downloadWordFaButton">
-                Word فارسی
-            </button>
-            <button type="button" id="downloadWordEnButton">
-                Word English
-            </button>
+            <button type="button" id="notesButton">Generate Meeting Notes with AI</button>
+            <span id="notesStatus" role="status" aria-live="polite"></span>
         </div>
 
         <button id="closeTranscriptButton" class="cancel">
@@ -681,13 +677,61 @@
         document.getElementById("downloadTxtButton").onclick =
             () => downloadTranscript("txt");
 
-        document.getElementById("downloadWordFaButton").onclick =
-            () => downloadTranscript("docx", "fa");
+        const notesButton = document.getElementById("notesButton");
+        const notesStatus = document.getElementById("notesStatus");
+        let notesPoll = null;
+        let notesReady = false;
+        let notesViewVersion = 0;
 
-        document.getElementById("downloadWordEnButton").onclick =
-            () => downloadTranscript("docx", "en");
+        async function updateNotes(sessionId, version) {
+            const response = await fetch(`/api/sessions/${encodeURIComponent(sessionId)}/notes/status`, {cache: "no-store"});
+            const data = await response.json();
+            if (version !== notesViewVersion || activeTranscriptSessionId !== sessionId) return;
+            if (!response.ok) throw new Error(data.error || "Could not load notes status.");
+            notesReady = data.state === "ready";
+            notesButton.disabled = data.state === "generating";
+            notesButton.textContent = notesReady ? "Download AI-Generated Notes (Word)" :
+                data.state === "generating" ? "Generating AI Notes…" :
+                data.state === "error" ? "Retry Meeting Notes with AI" : "Generate Meeting Notes with AI";
+            notesStatus.textContent = data.error || data.progress || "";
+            if (data.state === "generating" && transcriptDialog.open) {
+                notesPoll = setTimeout(() => updateNotes(sessionId, version).catch(error => {
+                    if (version === notesViewVersion) notesStatus.textContent = error.message;
+                }), 2000);
+            }
+        }
+
+        transcriptDialog.addEventListener("close", () => {
+            clearTimeout(notesPoll); notesViewVersion++;
+        });
+        notesButton.onclick = async () => {
+            const sessionId = activeTranscriptSessionId;
+            const version = notesViewVersion;
+            if (!sessionId) return;
+            if (notesReady) {downloadTranscript("notes"); return;}
+            notesButton.disabled = true;
+            notesStatus.textContent = "Starting AI notes generation…";
+            try {
+                const response = await fetch(`/api/sessions/${encodeURIComponent(sessionId)}/notes/generate`, {method: "POST"});
+                const data = await response.json();
+                if (!response.ok) throw new Error(data.error || "Could not start AI notes.");
+                clearTimeout(notesPoll);
+                await updateNotes(sessionId, version);
+            } catch (error) {
+                if (version === notesViewVersion) {
+                    notesStatus.textContent = error.message;
+                    notesButton.disabled = false;
+                }
+            }
+        };
 
         async function viewTranscript(sessionId) {
+            clearTimeout(notesPoll);
+            const notesVersion = ++notesViewVersion;
+            notesReady = false;
+            notesButton.disabled = true;
+            notesButton.textContent = "Generate Meeting Notes with AI";
+            notesStatus.textContent = "";
             activeTranscriptSessionId = null;
             transcriptDownloads.hidden = true;
             transcriptSession.textContent = sessionId;
@@ -711,6 +755,9 @@
                 transcriptContent.textContent = data.transcript;
                 activeTranscriptSessionId = sessionId;
                 transcriptDownloads.hidden = false;
+                updateNotes(sessionId, notesVersion).catch(error => {
+                    if (notesVersion === notesViewVersion) notesStatus.textContent = error.message;
+                });
 
             } catch (error) {
                 transcriptContent.textContent = error.message;

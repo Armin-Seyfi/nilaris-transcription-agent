@@ -7,7 +7,8 @@ Seyfi** as an applied AI engineering and AI consulting portfolio project.
 Nilaris supports online meetings, classes, interviews, presentations and media
 playback. A Flask interface runs on localhost. Selected audio is sent to OpenAI
 only after transcription approval; completed untitled transcripts are sent as
-text automatically to generate display titles. Manual titles are preserved.
+text automatically to generate display titles. Manual titles are preserved. Clicking **Generate Meeting Notes with AI** sends
+the transcript text to OpenAI without an additional cost confirmation.
 
 ## Working features
 
@@ -18,14 +19,15 @@ text automatically to generate display titles. Manual titles are preserved.
 | Chunk preparation | Separate LOCAL/REMOTE streams; five-minute, mono 16 kHz, 64 kbps MP3 chunks |
 | Paid transcription control | Cost estimate and explicit Whisper approval; silent chunks skipped and cached results reused |
 | Timing | Chunk offsets retained; conservative boundary corrections with provenance in JSON |
-| Transcript export | TXT/JSON plus Persian and English Word exports |
+| Transcript export | Raw transcript TXT download; JSON retained internally |
 | Session archive | Monthly/yearly grouping, title/date search, inline title editing for any saved recording |
+| AI notes | User-triggered notes in the dominant Persian, English or German language, saved as a Word document for repeated downloads |
 | AI titles | One background GPT-4o mini request per untitled completed transcript; failed requests require manual retry |
 | Data management | Audio-only cleanup preserves transcripts/titles; whole sessions move to macOS Trash |
 | Audio download | On-demand MP3 of original session audio inside the collapsed Manage Session menu |
 
 **LOCAL and REMOTE identify audio sources, not individual speakers.** Nilaris does
-not currently perform participant diarization, create summaries or join meetings
+not currently perform participant diarization or join meetings
 as a bot.
 
 ## Architecture
@@ -37,7 +39,8 @@ flowchart TD
     C --> D[Local validation + cost approval]
     D --> E[Whisper transcription]
     E --> F[Timestamped TXT + JSON]
-    F --> G[Local history + Word export]
+    F --> G[Local history + TXT download]
+    F --> I[User-triggered AI notes + saved Word]
     F --> H[Automatic AI title + manual editing]
 ```
 
@@ -93,6 +96,34 @@ Audio cleanup/full-session trash includes the cached export; already-downloaded
 copies elsewhere on the computer remain under the user's control. If original
 audio has been removed, the download button is disabled.
 
+## AI meeting notes
+
+Open **Meeting Transcript** to download the original TXT or select **Generate
+Meeting Notes with AI**. There is no cost-confirmation dialog for notes. Generation
+runs in the background. Once successful, the button becomes **Download
+AI-Generated Notes (Word)**. Future downloads reuse the saved document without
+another AI request; notes remain available after audio-only cleanup.
+
+The dominant spoken language determines narrative language, localized headings,
+and Word formatting: Persian uses RTL paragraphs and tables; English and German
+use LTR. Dates follow the existing Berlin recording metadata, with Jalali and
+Gregorian dates for Persian. Notes are interpretive AI output; the original
+transcript stays unchanged and should be consulted for consequential decisions.
+
+Long transcripts are processed in complete contiguous parts, then synthesized;
+no title-style sampling is used. Successful extraction steps and the final AI
+response are checkpointed for explicit retries. Size limits fail clearly rather
+than silently truncating content. Repeated clicks do not launch duplicate jobs.
+Failures and interrupted jobs require an explicit retry and may have incurred API
+costs; SDK retries are disabled. Storage deletion is blocked during generation,
+and all notes/checkpoints live inside the session directory, so whole-session
+Trash includes them. The prompt and structured output validation distinguish
+proposals from decisions and leave unspecified owners or dates unassigned.
+
+See [the system prompt](docs/meeting-notes-system-prompt.md). Tests use synthetic
+transcripts and mocked AI responses; they verify workflow and formatting structure,
+not the factual accuracy of a real model-generated summary.
+
 ## Reliability and evaluation
 
 The recorder checks device composition, channel identity, incoming buffers and
@@ -128,6 +159,9 @@ Known limits:
 Record only with appropriate participant consent. Whisper receives the approved
 non-silent pending chunks; AI title generation receives transcript text or excerpts.
 Automatic titles incur API charges without a separate per-title confirmation.
+AI notes send the complete transcript text after a user click, without another
+cost confirmation. Long recordings use multiple extraction calls plus synthesis.
+Saved notes downloads are local and do not incur new API costs.
 Requests are bounded and are not silently retried after failure. Manual editing
 and archive search are local and free.
 
@@ -139,7 +173,7 @@ source code, documentation and synthetic tests, not private sessions.
 
 - Wider hardware and macOS compatibility testing
 - Speaker diarization and echo handling
-- Transcript summaries and action items
+- Human evaluation of notes against meeting decisions and action items
 - Evaluation against reference transcripts
 
 Technical notes: [audio routing](docs/AUDIO_AUTOMATION.md),

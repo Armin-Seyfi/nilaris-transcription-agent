@@ -4,8 +4,6 @@ configure_media_path()
 
 from pathlib import Path
 import json
-from io import BytesIO
-from transcript_exporter import create_transcript_docx
 import threading
 from functools import wraps
 from flask import Flask, jsonify, request, render_template, send_file
@@ -16,6 +14,7 @@ from app_paths import OUTPUTS_DIR
 from session_storage import remove_session_audio, trash_entire_session
 from session_titles import TitleService, AutomaticTitleWorker, save_title
 from session_audio_export import AudioExportManager, cached_export
+from meeting_notes import NotesManager, notes_paths
 
 app = Flask(__name__)
 app.config["TEMPLATES_AUTO_RELOAD"] = True
@@ -26,6 +25,7 @@ audio_export_manager = AudioExportManager()
 
 
 operation_lock = threading.Lock()
+notes_manager = NotesManager(save_guard=operation_lock)
 title_service = TitleService(save_guard=operation_lock)
 title_worker = AutomaticTitleWorker(title_service, operation_lock,
     lambda: controller.get_status().get('state') in ('idle', 'auto_stopped')
@@ -79,6 +79,7 @@ def protect_recording_api():
                 "/title/generate",
                 "/title/retry",
                 "/audio/prepare",
+                "/notes/generate",
             ))
         )
     ):
@@ -183,6 +184,45 @@ def recording_status():
     return jsonify(controller.get_status())
 
 
+@app.post("/api/sessions/<session_id>/notes/generate")
+@coordinated_storage_operation
+def generate_session_notes(session_id):
+    try:
+        return jsonify(notes_manager.start(session_id)), 202
+    except FileNotFoundError as error:
+        return jsonify({'error': str(error)}), 404
+    except ValueError as error:
+        return jsonify({'error': str(error)}), 400
+    except RuntimeError as error:
+        return jsonify({'error': str(error)}), 409
+
+
+@app.get("/api/sessions/<session_id>/notes/status")
+def session_notes_status(session_id):
+    try:
+        return jsonify(notes_manager.status(session_id))
+    except FileNotFoundError as error:
+        return jsonify({'error': str(error)}), 404
+    except ValueError as error:
+        return jsonify({'error': str(error)}), 400
+
+
+@app.get("/api/sessions/<session_id>/download/notes")
+def download_session_notes(session_id):
+    try:
+        state = notes_manager.status(session_id)
+        if state['state'] != 'ready':
+            return jsonify({'error': 'Generate AI notes before downloading.'}), 409
+        folder = notes_paths(session_id)
+        return send_file(folder/'ai_notes.docx', as_attachment=True,
+            mimetype='application/vnd.openxmlformats-officedocument.wordprocessingml.document',
+            download_name=f"{session_id}_ai_notes_{state['language']}.docx")
+    except FileNotFoundError as error:
+        return jsonify({'error': str(error)}), 404
+    except ValueError as error:
+        return jsonify({'error': str(error)}), 400
+
+
 @app.get("/api/sessions/<session_id>/transcript")
 def get_session_transcript(session_id):
     """Read an existing transcript without modifying files."""
@@ -241,65 +281,6 @@ def download_session_txt(session_id):
     )
 
 
-@app.get("/api/sessions/<session_id>/download/docx")
-def download_session_docx(session_id):
-    """Generate a Word document from the saved transcript."""
-
-    import re
-
-    if not re.fullmatch(
-        r"nilaris_\d{4}-\d{2}-\d{2}T\d{2}-\d{2}-\d{2}Z",
-        session_id,
-    ):
-        return jsonify({"error": "Invalid session ID."}), 400
-
-    language = request.args.get("language", "fa")
-    if language not in ("fa", "en"):
-        return jsonify({"error": "Invalid document language."}), 400
-
-    outputs_root = OUTPUTS_DIR
-    folder = outputs_root / f"{session_id}_separated"
-    transcript_path = folder / "transcript.json"
-    metadata_path = folder / "session_metadata.json"
-
-    if any(
-        path.is_symlink()
-        for path in (outputs_root, folder, transcript_path, metadata_path)
-    ):
-        return jsonify({"error": "Unsafe transcript path."}), 400
-
-    if not transcript_path.is_file() or not metadata_path.is_file():
-        return jsonify({"error": "Transcript data not found."}), 404
-
-    try:
-        transcript = json.loads(
-            transcript_path.read_text(encoding="utf-8")
-        )
-        metadata = json.loads(
-            metadata_path.read_text(encoding="utf-8")
-        )
-
-        content = create_transcript_docx(
-            transcript,
-            metadata,
-            language=language,
-        )
-
-    except (ValueError, KeyError, TypeError) as error:
-        return jsonify({
-            "error": f"Cannot generate Word document: {error}"
-        }), 422
-
-    return send_file(
-        BytesIO(content),
-        mimetype=(
-            "application/vnd.openxmlformats-officedocument."
-            "wordprocessingml.document"
-        ),
-        as_attachment=True,
-        download_name=f"{session_id}_transcript_{language}.docx",
-    )
-
 
 @app.post("/api/sessions/<session_id>/prepare")
 @coordinated_storage_operation
@@ -343,6 +324,8 @@ def prepare_saved_session(session_id):
 def ensure_session_storage_available():
     """Block storage changes while recording or processing is active."""
 
+    if notes_manager.busy():
+        raise RuntimeError('Wait for AI notes generation to finish before managing session files.')
     if audio_export_manager.busy():
         raise RuntimeError('Wait for audio download preparation to finish before managing session files.')
     recording_state = controller.get_status().get("state")
@@ -487,6 +470,7 @@ def health():
     return jsonify({
         "application": "Nilaris",
         "audio_export_active": audio_export_manager.busy(),
+        "notes_generation_active": notes_manager.busy(),
         "status": "running",
         "mode": "local"
     })
