@@ -4,7 +4,7 @@ import re
 from pathlib import Path
 
 
-from app_paths import RECORDINGS_DIR, OUTPUTS_DIR
+from app_paths import RECORDINGS_DIR, OUTPUTS_DIR, AUDIO_EXPORTS_DIR
 
 SESSION_ID_PATTERN = re.compile(
     r"nilaris_\d{4}-\d{2}-\d{2}T\d{2}-\d{2}-\d{2}Z"
@@ -26,6 +26,7 @@ def get_session_files(session_id):
     title_job = RECORDINGS_DIR / f"{session_id}.title-job.json"
     session_dir = OUTPUTS_DIR / f"{session_id}_separated"
     legacy_dir = OUTPUTS_DIR / session_id
+    audio_exports = AUDIO_EXPORTS_DIR / session_id
 
     if (
         recording.is_symlink()
@@ -34,6 +35,7 @@ def get_session_files(session_id):
         or title_job.is_symlink()
         or session_dir.is_symlink()
         or legacy_dir.is_symlink()
+        or audio_exports.is_symlink()
     ):
         raise ValueError("Symbolic links are not allowed.")
 
@@ -63,6 +65,7 @@ def get_session_files(session_id):
         "title_job": str(title_job) if title_job.is_file() else None,
         "session_directory": str(session_dir) if has_outputs else None,
         "legacy_directory": str(legacy_dir) if has_legacy_outputs else None,
+        "audio_export_directory": str(audio_exports) if audio_exports.is_dir() else None,
         "has_audio": has_audio,
         "has_transcript": has_transcript,
         "recording_size_mb": (
@@ -199,6 +202,12 @@ def remove_session_audio(session_id):
     if not paths:
         raise ValueError("No audio files remain in this session.")
 
+    if session['audio_export_directory']:
+        folder = Path(session['audio_export_directory'])
+        _check_safe_path(folder, AUDIO_EXPORTS_DIR)
+        _check_session_tree(folder)
+        paths.append(folder)
+
     return _move_all_to_trash(paths)
 
 
@@ -206,6 +215,11 @@ def trash_entire_session(session_id):
     """Trash original recording and session output directory."""
     session = get_session_files(session_id)
     paths = []
+    if session['audio_export_directory']:
+        folder = Path(session['audio_export_directory'])
+        _check_safe_path(folder, AUDIO_EXPORTS_DIR)
+        _check_session_tree(folder)
+        paths.append(folder)
     for key in ('title_metadata', 'title_job'):
         if session[key]:
             path = Path(session[key])

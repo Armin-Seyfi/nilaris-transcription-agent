@@ -22,6 +22,7 @@ text automatically to generate display titles. Manual titles are preserved.
 | Session archive | Monthly/yearly grouping, title/date search, inline title editing for any saved recording |
 | AI titles | One background GPT-4o mini request per untitled completed transcript; failed requests require manual retry |
 | Data management | Audio-only cleanup preserves transcripts/titles; whole sessions move to macOS Trash |
+| Audio download | On-demand MP3 of original session audio inside the collapsed Manage Session menu |
 
 **LOCAL and REMOTE identify audio sources, not individual speakers.** Nilaris does
 not currently perform participant diarization, create summaries or join meetings
@@ -81,6 +82,16 @@ Record, stop, prepare the recording, review the Whisper estimate and confirm.
 The background worker then generates a title for an untitled completed transcript.
 Use the pencil to edit any saved session title, including before transcription.
 A manually assigned title is never automatically replaced.
+
+Expand **Manage Session** and select **Download Session Audio (MP3)** to prepare
+a local MP3 download. This works for old and new recordings, before or after
+transcription, while the original CAF remains available. All recorded channels
+are mixed equally into mono 44.1 kHz, 128 kbps audio, without trimming silence or
+guessing historical speaker roles. The original stays untouched. Completed exports
+are cached in the private data directory and reused while the source is unchanged.
+Audio cleanup/full-session trash includes the cached export; already-downloaded
+copies elsewhere on the computer remain under the user's control. If original
+audio has been removed, the download button is disabled.
 
 ## Reliability and evaluation
 

@@ -33,6 +33,7 @@ logs/
 *.log
 audio_route_recovery.json
 audio_input_migration.json
+audio_exports/
 
 # Local development backups and experiments
 *_backup.py

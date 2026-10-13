@@ -15,11 +15,13 @@ from session_history import list_sessions
 from app_paths import OUTPUTS_DIR
 from session_storage import remove_session_audio, trash_entire_session
 from session_titles import TitleService, AutomaticTitleWorker, save_title
+from session_audio_export import AudioExportManager, cached_export
 
 app = Flask(__name__)
 app.config["TEMPLATES_AUTO_RELOAD"] = True
 controller = RecordingController()
 processing_manager = ProcessingManager()
+audio_export_manager = AudioExportManager()
 
 
 
@@ -76,6 +78,7 @@ def protect_recording_api():
                 "/title/quote",
                 "/title/generate",
                 "/title/retry",
+                "/audio/prepare",
             ))
         )
     ):
@@ -340,6 +343,8 @@ def prepare_saved_session(session_id):
 def ensure_session_storage_available():
     """Block storage changes while recording or processing is active."""
 
+    if audio_export_manager.busy():
+        raise RuntimeError('Wait for audio download preparation to finish before managing session files.')
     recording_state = controller.get_status().get("state")
 
     if recording_state not in ("idle", "auto_stopped"):
@@ -399,6 +404,53 @@ def trash_saved_session(session_id):
         return jsonify({"error": str(error)}), 409
 
 
+@app.post("/api/sessions/<session_id>/audio/prepare")
+@coordinated_storage_operation
+def prepare_session_audio_download(session_id):
+    try:
+        if controller.get_status().get('state') not in ('idle', 'auto_stopped'):
+            raise RuntimeError('Stop or recover the active recording before preparing an audio download.')
+        return jsonify(audio_export_manager.prepare(session_id)), 202
+    except ValueError as error:
+        return jsonify({'error': str(error)}), 400
+    except FileNotFoundError as error:
+        return jsonify({'error': str(error)}), 404
+    except RuntimeError as error:
+        return jsonify({'error': str(error)}), 409
+
+
+@app.get("/api/sessions/<session_id>/audio/status")
+def session_audio_download_status(session_id):
+    try:
+        return jsonify(audio_export_manager.status(session_id))
+    except ValueError as error:
+        return jsonify({'error': str(error)}), 400
+
+
+@app.get("/api/sessions/<session_id>/download/audio")
+@coordinated_storage_operation
+def download_session_audio(session_id):
+    try:
+        audio = cached_export(session_id)
+        if audio is None:
+            return jsonify({'error': 'Prepare the MP3 download first.'}), 409
+        # Open before releasing the lock so a concurrent recoverable cleanup does
+        # not invalidate the streamed response on macOS.
+        file = audio.open('rb')
+        try:
+            response = send_file(file, mimetype='audio/mpeg', as_attachment=True,
+                download_name=f'{session_id}_audio.mp3', max_age=0)
+            response.call_on_close(file.close)
+            return response
+        except Exception:
+            file.close()
+            raise
+    except ValueError as error:
+        return jsonify({'error': str(error)}), 400
+    except FileNotFoundError as error:
+        return jsonify({'error': str(error)}), 404
+
+
 @app.post("/api/sessions/<session_id>/title")
 @app.post("/api/sessions/<session_id>/title/retry")
 @coordinated_storage_operation
@@ -434,6 +486,7 @@ def get_sessions():
 def health():
     return jsonify({
         "application": "Nilaris",
+        "audio_export_active": audio_export_manager.busy(),
         "status": "running",
         "mode": "local"
     })

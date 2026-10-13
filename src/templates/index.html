@@ -1041,7 +1041,7 @@
         setInterval(() => { if (automaticTitlesPending && !document.querySelector(".sessionTitleEditor")) refreshSessionHistory(); }, 10000);
 
         async function refreshSessionHistory() {
-            if (document.querySelector(".sessionTitleEditor")) return;
+            if (document.querySelector(".sessionTitleEditor, .audioDownloadPreparing")) return;
             const listEl = document.getElementById("sessionsList");
             const historyStatus = document.getElementById("historyStatus");
 
@@ -1291,6 +1291,51 @@
                     const manageTitle = document.createElement("summary");
                     manageTitle.textContent = "Manage Session";
                     manageMenu.appendChild(manageTitle);
+
+                    const downloadAudio = document.createElement("button");
+                    downloadAudio.type = "button";
+                    downloadAudio.textContent = "Download Session Audio (MP3)";
+                    downloadAudio.disabled = !session.has_audio;
+                    downloadAudio.title = session.has_audio
+                        ? "Prepare and download a mixed MP3 of the original session audio"
+                        : "Session audio has been removed and cannot be downloaded";
+                    const downloadStatus = document.createElement("div");
+                    downloadStatus.setAttribute("role", "status");
+                    downloadStatus.style.cssText = "font-size:12px;margin:6px 0";
+                    if (!session.has_audio) downloadStatus.textContent = "Session audio is no longer available.";
+                    downloadAudio.onclick = async () => {
+                        downloadAudio.disabled = true;
+                        downloadAudio.classList.add("audioDownloadPreparing");
+                        downloadAudio.textContent = "Preparing MP3…";
+                        downloadStatus.textContent = "Preparing locally. Long recordings may take a few minutes.";
+                        const base = `/api/sessions/${encodeURIComponent(session.session_id)}`;
+                        try {
+                            const response = await fetch(`${base}/audio/prepare`, {method:"POST"});
+                            let job = await response.json();
+                            if (!response.ok) throw new Error(job.error || "Audio preparation failed.");
+                            while (job.state === "preparing") {
+                                await new Promise(resolve => setTimeout(resolve, 1000));
+                                const status = await fetch(`${base}/audio/status`, {cache:"no-store"});
+                                job = await status.json();
+                                if (!status.ok) throw new Error(job.error || "Could not check audio preparation.");
+                            }
+                            if (job.state !== "ready") throw new Error(job.error || "Audio preparation interrupted. Try again.");
+                            const link = document.createElement("a");
+                            link.href = `${base}/download/audio`;
+                            link.download = `${session.session_id}_audio.mp3`;
+                            document.body.appendChild(link);
+                            link.click();
+                            link.remove();
+                            downloadStatus.textContent = "MP3 ready. Download requested.";
+                        } catch (error) {
+                            downloadStatus.textContent = error.message;
+                        } finally {
+                            downloadAudio.disabled = false;
+                            downloadAudio.classList.remove("audioDownloadPreparing");
+                            downloadAudio.textContent = "Download Session Audio (MP3)";
+                        }
+                    };
+                    manageMenu.append(downloadAudio, downloadStatus);
 
                     if (session.has_transcript && session.has_audio) {
                         const removeAudio = document.createElement("button");

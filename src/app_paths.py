@@ -14,6 +14,7 @@ DATA_ROOT = Path(
 
 RECORDINGS_DIR = DATA_ROOT / "recordings"
 OUTPUTS_DIR = DATA_ROOT / "outputs"
+AUDIO_EXPORTS_DIR = DATA_ROOT / "audio_exports"
 
 # Keep logs in the project until the launcher is migrated.
 LOGS_DIR = PROJECT_ROOT / "logs"
