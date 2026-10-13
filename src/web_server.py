@@ -1,3 +1,7 @@
+from media_environment import configure_media_path
+
+configure_media_path()
+
 from pathlib import Path
 import json
 from io import BytesIO
