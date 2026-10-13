@@ -14,11 +14,13 @@ from processing_manager import ProcessingManager
 from session_history import list_sessions
 from app_paths import OUTPUTS_DIR
 from session_storage import remove_session_audio, trash_entire_session
+from session_titles import TitleService, save_title
 
 app = Flask(__name__)
 app.config["TEMPLATES_AUTO_RELOAD"] = True
 controller = RecordingController()
 processing_manager = ProcessingManager()
+title_service = TitleService()
 
 
 
@@ -67,6 +69,9 @@ def protect_recording_api():
                 "/prepare",
                 "/remove-audio",
                 "/trash",
+                "/title",
+                "/title/quote",
+                "/title/generate",
             ))
         )
     ):
@@ -388,6 +393,35 @@ def trash_saved_session(session_id):
 
     except RuntimeError as error:
         return jsonify({"error": str(error)}), 409
+
+
+@app.post("/api/sessions/<session_id>/title")
+@app.post("/api/sessions/<session_id>/title/quote")
+@app.post("/api/sessions/<session_id>/title/generate")
+@coordinated_storage_operation
+def session_title_operation(session_id):
+    try:
+        ensure_session_storage_available()
+        data = request.get_json(silent=True) or {}
+        if not isinstance(data, dict):
+            raise ValueError('Invalid title request.')
+        if request.path.endswith('/quote'):
+            result = title_service.quote(session_id)
+        elif request.path.endswith('/generate'):
+            result = title_service.generate(session_id, data.get('approval_token'), data.get('approved'))
+        else:
+            result = save_title(session_id, data.get('title'))
+        return jsonify(result)
+    except ValueError as error:
+        return jsonify({'error': str(error)}), 400
+    except FileNotFoundError as error:
+        return jsonify({'error': str(error)}), 404
+    except RuntimeError as error:
+        return jsonify({'error': str(error)}), 409
+    except Exception:
+        app.logger.exception('Session title operation failed')
+        return jsonify({'error': 'Title operation failed; existing title preserved. '
+                                  'If an AI request was sent it may have been billed. No automatic retry.'}), 502
 
 
 @app.get("/api/sessions")
