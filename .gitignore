@@ -29,6 +29,10 @@ outputs/
 *.title-job.json
 update_backups/
 review/
+logs/
+*.log
+audio_route_recovery.json
+audio_input_migration.json
 
 # Local development backups and experiments
 *_backup.py

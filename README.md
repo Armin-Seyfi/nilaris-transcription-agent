@@ -1,52 +1,139 @@
 # Nilaris Transcription Agent
 
-A Python-based AI meeting transcription tool for macOS.
+A local macOS app for recording microphone and system audio, transcribing it with
+OpenAI Whisper, and browsing an editable transcript archive. Built by **Armin
+Seyfi** as an applied AI engineering and AI consulting portfolio project.
 
-## Project Goal
+Nilaris supports online meetings, classes, interviews, presentations and media
+playback. A Flask interface runs on localhost. Selected audio is sent to OpenAI
+only after transcription approval; completed untitled transcripts are sent as
+text automatically to generate display titles. Manual titles are preserved.
 
-Build an AI-powered meeting assistant that captures business conversations in Persian and English, transcribes them, and produces structured outputs for downstream LLM processing.
+## Working features
+
+| Capability | Behavior |
+| --- | --- |
+| Microphone + system capture | Explicit CoreAudio device binding and verified per-recording channel metadata |
+| Speaker/headphone routing | Temporary BlackHole + listening-device output while recording; prior output restored afterward |
+| Chunk preparation | Separate LOCAL/REMOTE streams; five-minute, mono 16 kHz, 64 kbps MP3 chunks |
+| Paid transcription control | Cost estimate and explicit Whisper approval; silent chunks skipped and cached results reused |
+| Timing | Chunk offsets retained; conservative boundary corrections with provenance in JSON |
+| Transcript export | TXT/JSON plus Persian and English Word exports |
+| Session archive | Monthly/yearly grouping, title/date search, inline title editing for any saved recording |
+| AI titles | One background GPT-4o mini request per untitled completed transcript; failed requests require manual retry |
+| Data management | Audio-only cleanup preserves transcripts/titles; whole sessions move to macOS Trash |
+
+**LOCAL and REMOTE identify audio sources, not individual speakers.** Nilaris does
+not currently perform participant diarization, create summaries or join meetings
+as a bot.
 
 ## Architecture
 
-Google Meet Audio
-    -> macOS Audio Capture
-    -> 5-Minute Audio Chunks
-    -> MP3 Compression
-    -> OpenAI Whisper API
-    -> Timestamped Transcription
-    -> JSON / TXT Export
+```mermaid
+flowchart TD
+    A[Built-in microphone + BlackHole] --> B[Swift recorder + capture metadata]
+    B --> C[FFmpeg source separation + chunks]
+    C --> D[Local validation + cost approval]
+    D --> E[Whisper transcription]
+    E --> F[Timestamped TXT + JSON]
+    F --> G[Local history + Word export]
+    F --> H[Automatic AI title + manual editing]
+```
 
-## Development Status
+The Swift recorder owns audio binding, format checks and route recovery. Python
+validates capture metadata, prepares chunks, controls transcription approval and
+serves the archive. Transcript and title generation are separate: a title error
+does not invalidate successful transcription.
 
-**Status: Early Development**
+## Run locally
 
-### MVP v0.1 - Planned
-- Capture meeting audio on macOS
-- Support speakers and headphones
-- Process audio in 5-minute batches
-- Compress audio before API submission
-- Transcribe Persian and English conversations
-- Export timestamped JSON and readable TXT
+Requirements: macOS, a Swift toolchain, Python with the packages in
+`requirements.txt`, FFmpeg/ffprobe, BlackHole 2ch, and an OpenAI API key with access
+to Whisper and `gpt-4o-mini`. This version has been tested on one development Mac;
+other device combinations require validation.
 
-### Future Roadmap
-- AI-generated meeting summaries
-- Meeting minutes and action items
-- Speaker diarization
-- Overlapping audio chunks
-- Google Meet bot integration
+```bash
+git clone https://github.com/Armin-Seyfi/nilaris-transcription-agent.git
+cd nilaris-transcription-agent
+python3 -m venv .venv
+source .venv/bin/activate
+python -m pip install -r requirements.txt
+cp .env.example .env
+```
 
-## Privacy
+Set `OPENAI_API_KEY` in `.env`. Do not commit the key. Ensure FFmpeg and BlackHole
+are installed. In Audio MIDI Setup, create an Aggregate Input named **Nilaris
+Audio Input** containing BlackHole 2ch and the built-in microphone at 48 kHz. Keep
+the meeting application's microphone set to a real microphone and its playback
+set to system default. Nilaris resolves the aggregate channel order from device
+metadata rather than assuming it.
 
-Meeting recordings, transcripts, and API credentials are excluded from Git version control.
+```bash
+./launch_nilaris.sh
+```
 
-Record meetings only with appropriate participant consent and in accordance with applicable privacy requirements.
+The launcher uses `~/Library/Application Support/Nilaris` for persistent data and
+opens `http://127.0.0.1:8765` in Google Chrome. Alternatively, run
+`python src/web_server.py` and open that address in a browser; set `NILARIS_DATA_DIR`
+to an external directory to keep development data outside the checkout.
 
-## Technology
+Record, stop, prepare the recording, review the Whisper estimate and confirm.
+The background worker then generates a title for an untitled completed transcript.
+Use the pencil to edit any saved session title, including before transcription.
+A manually assigned title is never automatically replaced.
 
-Python, OpenAI Whisper API, FFmpeg, BlackHole, Git.
+## Reliability and evaluation
+
+The recorder checks device composition, channel identity, incoming buffers and
+actual CAF frames. It preserves partial recordings and reports failures instead
+of accepting empty or mismapped captures. Temporary routing is restored on normal
+shutdown and recoverable failures; a journal supports crash recovery.
+
+Tests use synthetic files and mocked AI responses:
+
+```bash
+python -m unittest discover -s tests
+```
+
+These tests do not record audio or make paid API calls. Manual development checks
+have covered speaker and stereo Bluetooth headphone capture. This is a personal
+working MVP, not a claim of production readiness or universal hardware support.
+
+Known limits:
+
+- Device selection occurs when recording starts. Headphone connection/disconnection
+  during recording may stop capture safely; seamless switching is not implemented.
+- Playback outside recording follows macOS settings. Nilaris does not continuously
+  manage the system output when idle.
+- Apps using a fixed output may bypass system-default routing.
+- Speaker leakage can reach the microphone; echo cancellation is not implemented.
+- Timestamp repair is approximate, not forced word alignment.
+- Historical raw recordings without verified mapping metadata are not guessed.
+- Long-transcript titles use distributed excerpts and can miss a topic. Model
+  access, account quotas and network failures can prevent AI title generation.
+
+## Privacy and costs
+
+Record only with appropriate participant consent. Whisper receives the approved
+non-silent pending chunks; AI title generation receives transcript text or excerpts.
+Automatic titles incur API charges without a separate per-title confirmation.
+Requests are bounded and are not silently retried after failure. Manual editing
+and archive search are local and free.
+
+Credentials, recordings, transcript outputs, title sidecars, diagnostic previews
+and local update backups are excluded from version control. The repository contains
+source code, documentation and synthetic tests, not private sessions.
+
+## Next steps
+
+- Wider hardware and macOS compatibility testing
+- Speaker diarization and echo handling
+- Transcript summaries and action items
+- Evaluation against reference transcripts
+
+Technical notes: [audio routing](docs/AUDIO_AUTOMATION.md),
+[timestamp repair](docs/TIMESTAMP_REPAIR.md), [session titles](docs/SESSION_TITLES.md).
 
 ## Author
 
-Armin Seyfi
-
-AI Consulting | Business Strategy & AI Integration
+**Armin Seyfi** — AI Consulting · Business Strategy · AI Integration
