@@ -278,23 +278,6 @@
         </section>
     </main>
 
-    <dialog id="titleDialog" style="max-width:620px;width:90%">
-        <h2>Session title</h2>
-        <p id="titleSessionDate"></p>
-        <p>Content type — Specific topic | Context, when known</p>
-        <label for="sessionTitleInput">Display title (up to 160 characters)</label>
-        <input id="sessionTitleInput" maxlength="160" dir="auto" style="width:100%;box-sizing:border-box;margin:8px 0" />
-        <p>Editing is free. This changes the history label and preserves transcript files.</p>
-        <p id="titleStatus" role="status"></p>
-        <div id="titleQuotePanel" hidden>
-            <p id="titleQuoteDetails"></p>
-            <button type="button" id="confirmTitleGeneration">Approve cost and generate title</button>
-        </div>
-        <button type="button" id="saveSessionTitle">Save title</button>
-        <button type="button" id="quoteTitleGeneration">Generate with AI…</button>
-        <button type="button" id="closeTitleDialog">Close</button>
-    </dialog>
-
     <dialog id="transcriptDialog">
         <h2>Meeting Transcript</h2>
         <p id="transcriptSession"></p>
@@ -992,107 +975,73 @@
             }
         }
 
-        let titleSessionId = null;
-        let titleApprovalToken = null;
-        let titleBusy = false;
-
         function titleSearchText(value) {
             return String(value || "").normalize("NFKC").toLowerCase()
                 .replace(/ي/g, "ی").replace(/ك/g, "ک").replace(/\u200c/g, " ");
         }
 
-        async function titleRequest(action, body) {
-            const response = await fetch(
-                `/api/sessions/${encodeURIComponent(titleSessionId)}/title${action}`, {
-                    method: "POST", headers: {"Content-Type": "application/json"},
-                    body: JSON.stringify(body)
-                });
-            const data = await response.json();
-            if (!response.ok) throw new Error(data.error || "Title operation failed.");
-            return data;
+        async function postSessionTitle(sessionId, suffix, body) {
+            const response = await fetch(`/api/sessions/${encodeURIComponent(sessionId)}/title${suffix}`, {
+                method: "POST", headers: {"Content-Type": "application/json"}, body: JSON.stringify(body)
+            });
+            const result = await response.json();
+            if (!response.ok) throw new Error(result.error || "Title could not be saved.");
+            return result;
         }
 
-        function setTitleBusy(busy) {
-            titleBusy = busy;
-            for (const id of ["saveSessionTitle", "quoteTitleGeneration", "confirmTitleGeneration", "closeTitleDialog", "sessionTitleInput"]) {
-                document.getElementById(id).disabled = busy;
-            }
+        function editTitleInline(session, row, name, pencil) {
+            if (row.querySelector(".sessionTitleEditor")) return;
+            name.hidden = true;
+            pencil.hidden = true;
+            const editor = document.createElement("div");
+            editor.className = "sessionTitleEditor";
+            editor.style.cssText = "width:100%;display:flex;flex-wrap:wrap;gap:6px";
+            const input = document.createElement("input");
+            input.value = session.title || "";
+            input.maxLength = 160;
+            input.dir = "auto";
+            input.setAttribute("aria-label", "Session title");
+            input.placeholder = "Name this recording";
+            input.style.cssText = "flex:1;min-width:160px;padding:6px";
+            const save = document.createElement("button");
+            save.textContent = "Save";
+            save.style.cssText = "width:auto;padding:6px 10px;margin:0;font-size:12px";
+            const cancel = document.createElement("button");
+            cancel.textContent = "Cancel";
+            cancel.style.cssText = "width:auto;padding:6px 10px;margin:0;font-size:12px";
+            const error = document.createElement("div");
+            error.style.cssText = "width:100%;font-size:12px";
+            error.setAttribute("role", "status");
+            const close = () => {editor.remove();name.hidden=false;pencil.hidden=false;};
+            cancel.onclick = close;
+            save.onclick = async () => {
+                save.disabled = true;cancel.disabled = true;input.disabled = true;
+                try {
+                    await postSessionTitle(session.session_id, "", {title:input.value});
+                    close();
+                    await refreshSessionHistory();
+                } catch (e) {error.textContent=e.message;}
+                finally {save.disabled=false;cancel.disabled=false;input.disabled=false;}
+            };
+            input.onkeydown = event => {
+                if (event.key === "Enter") {event.preventDefault();save.click();}
+                if (event.key === "Escape") {event.preventDefault();cancel.click();}
+            };
+            editor.append(input, save, cancel, error);
+            row.append(editor);
+            input.focus();
         }
 
-        function openTitleEditor(session) {
-            titleSessionId = session.session_id;
-            titleApprovalToken = null;
-            document.getElementById("sessionTitleInput").value = session.title || "";
-            document.getElementById("titleSessionDate").textContent = formatSessionDate(session.session_id);
-            document.getElementById("titleStatus").textContent = "No AI request has been sent.";
-            document.getElementById("titleQuotePanel").hidden = true;
-            setTitleBusy(false);
-            document.getElementById("titleDialog").showModal();
-        }
-
-        document.getElementById("titleDialog").addEventListener("cancel", event => {
-            if (titleBusy) event.preventDefault();
-        });
-        document.getElementById("closeTitleDialog").onclick = () => {
-            document.getElementById("titleDialog").close();
-            titleApprovalToken = null;
-        };
-        document.getElementById("sessionTitleInput").oninput = () => {
-            titleApprovalToken = null;
-            document.getElementById("titleQuotePanel").hidden = true;
-        };
-        document.getElementById("saveSessionTitle").onclick = async () => {
-            setTitleBusy(true);
-            try {
-                await titleRequest("", {title: document.getElementById("sessionTitleInput").value});
-                document.getElementById("titleDialog").close();
-                await refreshSessionHistory();
-            } catch (error) {
-                document.getElementById("titleStatus").textContent = error.message;
-            } finally { setTitleBusy(false); }
-        };
-        document.getElementById("quoteTitleGeneration").onclick = async () => {
-            setTitleBusy(true);
-            titleApprovalToken = null;
-            document.getElementById("titleQuotePanel").hidden = true;
-            try {
-                const quote = await titleRequest("/quote", {});
-                titleApprovalToken = quote.approval_token;
-                document.getElementById("titleQuoteDetails").textContent =
-                    `Model: ${quote.model}. Conservative estimated cost: $${quote.estimated_cost_usd.toFixed(6)}. ` +
-                    (quote.sampled ? "Excerpts from across the transcript" : "Transcript text") +
-                    " will be sent to OpenAI. " +
-                    (quote.current_title ? "Approval will replace the current display title. " : "") +
-                    "Any unsaved edits will be replaced by the AI title. Pricing estimate dated 13 Oct 2026.";
-                document.getElementById("titleQuotePanel").hidden = false;
-                document.getElementById("titleStatus").textContent = "Review the cost and data sharing before approving. No AI request sent yet.";
-            } catch (error) {
-                document.getElementById("titleStatus").textContent = error.message;
-            } finally { setTitleBusy(false); }
-        };
-        document.getElementById("confirmTitleGeneration").onclick = async () => {
-            if (!titleApprovalToken || titleBusy) return;
-            const token = titleApprovalToken;
-            titleApprovalToken = null;
-            setTitleBusy(true);
-            document.getElementById("titleQuotePanel").hidden = true;
-            document.getElementById("titleStatus").textContent = "Generating title…";
-            try {
-                const result = await titleRequest("/generate", {approval_token: token, approved: true});
-                document.getElementById("sessionTitleInput").value = result.title;
-                document.getElementById("titleStatus").textContent = "AI title saved. You can edit it freely.";
-                await refreshSessionHistory();
-            } catch (error) {
-                document.getElementById("titleStatus").textContent = error.message;
-            } finally { setTitleBusy(false); }
-        };
         let sessionSearchTimer;
+        let automaticTitlesPending = true;
         document.getElementById("sessionSearch").oninput = () => {
             clearTimeout(sessionSearchTimer);
             sessionSearchTimer = setTimeout(refreshSessionHistory, 200);
         };
+        setInterval(() => { if (automaticTitlesPending && !document.querySelector(".sessionTitleEditor")) refreshSessionHistory(); }, 10000);
 
         async function refreshSessionHistory() {
+            if (document.querySelector(".sessionTitleEditor")) return;
             const listEl = document.getElementById("sessionsList");
             const historyStatus = document.getElementById("historyStatus");
 
@@ -1106,6 +1055,8 @@
                 }
 
                 const data = await response.json();
+                automaticTitlesPending = data.sessions.some(session => session.has_transcript &&
+                    !session.title && session.title_state !== "failed");
                 const allCount = data.sessions.length;
                 const search = titleSearchText(document.getElementById("sessionSearch").value.trim());
                 data.sessions = data.sessions.filter(session => !search ||
@@ -1197,14 +1148,38 @@
                         `${duration} · ` +
                         `${session.recording_size_mb} MB`;
 
-                    item.append(name, details);
+                    const titleRow = document.createElement("div");
+                    titleRow.style.cssText = "display:flex;align-items:center;gap:8px";
+                    name.style.cssText = "flex:1;min-width:0;overflow-wrap:anywhere";
+                    const pencil = document.createElement("button");
+                    pencil.textContent = "✎";
+                    pencil.title = "Edit title";
+                    pencil.setAttribute("aria-label", "Edit session title");
+                    pencil.style.cssText = "width:auto;padding:2px 6px;margin:0;background:transparent;color:inherit;font-size:18px;flex-shrink:0";
+                    pencil.onclick = () => editTitleInline(session, titleRow, name, pencil);
+                    titleRow.append(name, pencil);
+                    item.append(titleRow, details);
+                    if (!session.title && session.has_transcript) {
+                        const state = document.createElement("div");
+                        state.style.cssText = "font-size:12px;margin:6px 0;color:#b9c0cc";
+                        if (session.title_state === "failed") {
+                            state.textContent = session.title_error || "AI title unavailable.";
+                            const retry = document.createElement("button");
+                            retry.textContent = "↻";
+                            retry.title = "Retry automatic AI title";
+                            retry.setAttribute("aria-label", "Retry AI title");
+                            retry.style.cssText = "width:auto;padding:2px 6px;margin:0 6px";
+                            retry.onclick = async () => {
+                                retry.disabled = true;
+                                try {await postSessionTitle(session.session_id, "/retry", {});await refreshSessionHistory();}
+                                catch (e) {state.textContent=e.message;}
+                            };
+                            state.append(retry);
+                        } else {state.textContent = "Generating title…";}
+                        item.append(state);
+                    }
 
                     if (session.has_transcript) {
-                        const titleButton = document.createElement("button");
-                        titleButton.className = "viewTranscriptButton";
-                        titleButton.textContent = session.title ? "Edit title" : "Add title";
-                        titleButton.onclick = () => openTitleEditor(session);
-                        item.appendChild(titleButton);
                         const button = document.createElement("button");
                         button.className = "viewTranscriptButton";
                         button.textContent = "View Transcript";

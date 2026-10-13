@@ -1,4 +1,4 @@
-"""Editable display titles; paid generation requires a single-use quote approval."""
+"""Editable titles and once-only automatic AI generation, authorized by the user."""
 import hashlib
 import json
 import os
@@ -10,10 +10,10 @@ import unicodedata
 from datetime import datetime, timezone
 from pathlib import Path
 
-from app_paths import OUTPUTS_DIR
+from app_paths import OUTPUTS_DIR, RECORDINGS_DIR
 from session_storage import SESSION_ID_PATTERN, _check_safe_path
 
-MODEL = 'gpt-4o-mini-2024-07-18'
+MODEL = 'gpt-4o-mini'
 INPUT_PRICE = 0.15 / 1_000_000
 OUTPUT_PRICE = 0.60 / 1_000_000
 MAX_OUTPUT_TOKENS = 512
@@ -40,15 +40,39 @@ SCHEMA = {'type': 'object', 'properties': {
     'required': ['kind', 'type_label', 'topic', 'context'], 'additionalProperties': False}
 
 
-def session_folder(session_id):
+def session_folder(session_id, require_transcript=True):
     if not isinstance(session_id, str) or not SESSION_ID_PATTERN.fullmatch(session_id):
         raise ValueError('Invalid session ID.')
     folder = OUTPUTS_DIR / (session_id + '_separated')
     for path in (folder, folder/'transcript.json', folder/'transcript.txt', folder/'session_title.json'):
         _check_safe_path(path, OUTPUTS_DIR)
-    if not (folder/'transcript.json').is_file() or not (folder/'transcript.txt').is_file():
+    recording = RECORDINGS_DIR / (session_id + '.caf')
+    _check_safe_path(recording, RECORDINGS_DIR)
+    if require_transcript and (not (folder/'transcript.json').is_file() or not (folder/'transcript.txt').is_file()):
         raise FileNotFoundError('A completed transcript is required for a title.')
+    if not require_transcript and not recording.is_file() and not folder.is_dir():
+        raise FileNotFoundError('Session not found.')
     return folder
+
+
+def sidecar(folder, suffix='title'):
+    session_id = Path(folder).name.removesuffix('_separated')
+    if not SESSION_ID_PATTERN.fullmatch(session_id):
+        raise ValueError('Invalid session ID.')
+    path = RECORDINGS_DIR / (session_id + '.' + suffix + '.json')
+    _check_safe_path(path, RECORDINGS_DIR)
+    return path
+
+
+def title_path(folder):
+    path = sidecar(folder)
+    # Keep titles from the previous version; migration occurs only upon editing.
+    if not path.exists():
+        legacy = Path(folder)/'session_title.json'
+        _check_safe_path(legacy, OUTPUTS_DIR)
+        if legacy.exists():
+            return legacy
+    return path
 
 
 def clean_title(value):
@@ -66,9 +90,8 @@ def clean_title(value):
 
 
 def read_title(folder):
-    path = Path(folder)/'session_title.json'
     try:
-        _check_safe_path(path, OUTPUTS_DIR)
+        path = title_path(folder)
         data = json.loads(path.read_text(encoding='utf-8'))
         return {'title': clean_title(data['title']), 'title_source': data.get('source', 'manual')}
     except (OSError, ValueError, KeyError, TypeError):
@@ -76,25 +99,27 @@ def read_title(folder):
 
 
 def revision(folder):
-    path = folder/'session_title.json'
+    path = title_path(folder)
     return hashlib.sha256(path.read_bytes()).hexdigest() if path.exists() else None
 
 
 def save_title(session_id, title, *, source='manual', details=None, expected_revision=None, check_revision=False):
-    folder = session_folder(session_id)
+    folder = session_folder(session_id, require_transcript=False)
     title = clean_title(title)
     if check_revision and revision(folder) != expected_revision:
         raise RuntimeError('Title changed; reopen the title editor before saving.')
-    path = folder/'session_title.json'
+    previous_path = title_path(folder)
+    path = sidecar(folder)
     history = []
-    if path.exists():
-        previous = json.loads(path.read_text(encoding='utf-8'))
+    if previous_path.exists():
+        previous = json.loads(previous_path.read_text(encoding='utf-8'))
         history = previous.get('history', [])[-9:]
         history.append({key: previous.get(key) for key in ('title', 'source', 'updated_at')})
     data = {'schema_version': 1, 'title': title, 'source': source,
             'updated_at': datetime.now(timezone.utc).isoformat(), 'history': history,
             'generation': details}
-    fd, name = tempfile.mkstemp(prefix='.title-', dir=folder)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fd, name = tempfile.mkstemp(prefix='.title-', dir=path.parent)
     try:
         with os.fdopen(fd, 'w', encoding='utf-8') as file:
             json.dump(data, file, ensure_ascii=False, indent=2)
@@ -128,9 +153,10 @@ def transcript_input(folder):
 
 
 class TitleService:
-    def __init__(self):
+    def __init__(self, save_guard=None):
         self.quotes = {}
         self.lock = threading.Lock()
+        self.save_guard = save_guard or threading.RLock()
 
     def quote(self, session_id):
         folder = session_folder(session_id)
@@ -192,5 +218,116 @@ class TitleService:
             'input_tokens': usage.prompt_tokens if usage else None,
             'output_tokens': usage.completion_tokens if usage else None,
             'estimated_actual_cost_usd': (usage.prompt_tokens*INPUT_PRICE + usage.completion_tokens*OUTPUT_PRICE) if usage else None}
-        return save_title(session_id, title, source='ai', details=details,
-                          expected_revision=quote['revision'], check_revision=True)
+        with self.save_guard:
+            session_folder(session_id)
+            return save_title(session_id, title, source='ai', details=details,
+                              expected_revision=quote['revision'], check_revision=True)
+
+
+def read_title_job(folder):
+    try:
+        data = json.loads(sidecar(folder, 'title-job').read_text(encoding='utf-8'))
+        return {'title_state': data.get('state'), 'title_error': data.get('error')}
+    except (OSError, ValueError, TypeError):
+        return {'title_state': None, 'title_error': None}
+
+
+def write_title_job(folder, state, error=None):
+    path = sidecar(folder, 'title-job')
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fd, temp = tempfile.mkstemp(prefix='.title-job-', dir=path.parent)
+    try:
+        with os.fdopen(fd, 'w', encoding='utf-8') as file:
+            json.dump({'state': state, 'error': error,
+                'updated_at': datetime.now(timezone.utc).isoformat()}, file)
+            file.flush()
+            os.fsync(file.fileno())
+        Path(temp).replace(path)
+    finally:
+        Path(temp).unlink(missing_ok=True)
+
+
+def title_error_message(error):
+    from openai import PermissionDeniedError, AuthenticationError, RateLimitError
+    if isinstance(error, PermissionDeniedError):
+        return 'OpenAI project cannot access gpt-4o-mini. Enable model access in project settings, then retry.'
+    if isinstance(error, AuthenticationError):
+        return 'OpenAI API key cannot authenticate. Check the configured key, then retry.'
+    if isinstance(error, RateLimitError):
+        return 'OpenAI rate or account quota limit reached. Check the account, then retry.'
+    return 'AI title could not be generated. Existing title preserved. Retry manually or edit the title.'
+
+
+class AutomaticTitleWorker:
+    def __init__(self, service, operation_lock, available):
+        self.service = service
+        self.operation_lock = operation_lock
+        self.available = available
+        self.wake = threading.Event()
+        self.thread = None
+        self.active = set()
+
+    def start(self):
+        if self.thread is None:
+            self.thread = threading.Thread(target=self.run, daemon=True, name='nilaris-titles')
+            self.thread.start()
+
+    def retry(self, session_id):
+        folder = session_folder(session_id)
+        if read_title(folder)['title']:
+            raise ValueError('This session already has a title. Edit it with the pencil.')
+        if session_id in self.active:
+            raise RuntimeError('Title generation is already in progress.')
+        write_title_job(folder, 'pending')
+        self.wake.set()
+        return {'state': 'pending', 'session_id': session_id}
+
+    def scan_once(self):
+        for folder in sorted(OUTPUTS_DIR.glob('nilaris_*_separated'), reverse=True):
+            session_id = folder.name.removesuffix('_separated')
+            if not self.available() or not self.operation_lock.acquire(blocking=False):
+                return
+            try:
+                try:
+                    session_folder(session_id)
+                except (ValueError, FileNotFoundError):
+                    continue
+                if read_title(folder)['title']:
+                    continue
+                state = read_title_job(folder)['title_state']
+                if state == 'generating' and session_id not in self.active:
+                    write_title_job(folder, 'failed', 'Previous title request was interrupted. Retry manually or edit the title.')
+                    continue
+                if state not in (None, 'pending'):
+                    continue  # Failed/interrupted requests never repeat on refresh/restart.
+                write_title_job(folder, 'generating')
+                self.active.add(session_id)
+            finally:
+                self.operation_lock.release()
+            try:
+                quote = self.service.quote(session_id)
+                self.service.generate(session_id, quote['approval_token'], True)
+                with self.operation_lock:
+                    session_folder(session_id)
+                    write_title_job(folder, 'completed')
+            except Exception as error:
+                with self.operation_lock:
+                    try:
+                        session_folder(session_id)
+                        # A user may have named the session during the network request.
+                        write_title_job(folder, 'completed' if read_title(folder)['title'] else 'failed',
+                                        None if read_title(folder)['title'] else title_error_message(error))
+                    except (ValueError, FileNotFoundError):
+                        pass
+            finally:
+                self.active.discard(session_id)
+
+    def run(self):
+        while True:
+            try:
+                self.scan_once()
+            except Exception:
+                import logging
+                logging.getLogger(__name__).exception('Automatic title scan failed')
+            self.wake.wait(10)
+            self.wake.clear()

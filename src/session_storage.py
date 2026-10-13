@@ -22,12 +22,16 @@ def get_session_files(session_id):
 
     recording = RECORDINGS_DIR / f"{session_id}.caf"
     capture_metadata = RECORDINGS_DIR / f"{session_id}.capture.json"
+    title_metadata = RECORDINGS_DIR / f"{session_id}.title.json"
+    title_job = RECORDINGS_DIR / f"{session_id}.title-job.json"
     session_dir = OUTPUTS_DIR / f"{session_id}_separated"
     legacy_dir = OUTPUTS_DIR / session_id
 
     if (
         recording.is_symlink()
         or capture_metadata.is_symlink()
+        or title_metadata.is_symlink()
+        or title_job.is_symlink()
         or session_dir.is_symlink()
         or legacy_dir.is_symlink()
     ):
@@ -55,6 +59,8 @@ def get_session_files(session_id):
         "session_id": session_id,
         "recording": str(recording) if has_audio else None,
         "capture_metadata": str(capture_metadata) if capture_metadata.is_file() else None,
+        "title_metadata": str(title_metadata) if title_metadata.is_file() else None,
+        "title_job": str(title_job) if title_job.is_file() else None,
         "session_directory": str(session_dir) if has_outputs else None,
         "legacy_directory": str(legacy_dir) if has_legacy_outputs else None,
         "has_audio": has_audio,
@@ -200,6 +206,11 @@ def trash_entire_session(session_id):
     """Trash original recording and session output directory."""
     session = get_session_files(session_id)
     paths = []
+    for key in ('title_metadata', 'title_job'):
+        if session[key]:
+            path = Path(session[key])
+            _check_safe_path(path, RECORDINGS_DIR)
+            paths.append(path)
 
     if session["recording"]:
         recording = Path(session["recording"])

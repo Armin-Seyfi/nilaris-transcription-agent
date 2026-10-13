@@ -14,17 +14,20 @@ from processing_manager import ProcessingManager
 from session_history import list_sessions
 from app_paths import OUTPUTS_DIR
 from session_storage import remove_session_audio, trash_entire_session
-from session_titles import TitleService, save_title
+from session_titles import TitleService, AutomaticTitleWorker, save_title
 
 app = Flask(__name__)
 app.config["TEMPLATES_AUTO_RELOAD"] = True
 controller = RecordingController()
 processing_manager = ProcessingManager()
-title_service = TitleService()
 
 
 
 operation_lock = threading.Lock()
+title_service = TitleService(save_guard=operation_lock)
+title_worker = AutomaticTitleWorker(title_service, operation_lock,
+    lambda: controller.get_status().get('state') in ('idle', 'auto_stopped')
+        and processing_manager.get_status().get('state') not in ('preparing', 'awaiting_confirmation', 'transcribing'))
 
 
 def coordinated_storage_operation(function):
@@ -72,6 +75,7 @@ def protect_recording_api():
                 "/title",
                 "/title/quote",
                 "/title/generate",
+                "/title/retry",
             ))
         )
     ):
@@ -396,19 +400,15 @@ def trash_saved_session(session_id):
 
 
 @app.post("/api/sessions/<session_id>/title")
-@app.post("/api/sessions/<session_id>/title/quote")
-@app.post("/api/sessions/<session_id>/title/generate")
+@app.post("/api/sessions/<session_id>/title/retry")
 @coordinated_storage_operation
 def session_title_operation(session_id):
     try:
-        ensure_session_storage_available()
         data = request.get_json(silent=True) or {}
         if not isinstance(data, dict):
             raise ValueError('Invalid title request.')
-        if request.path.endswith('/quote'):
-            result = title_service.quote(session_id)
-        elif request.path.endswith('/generate'):
-            result = title_service.generate(session_id, data.get('approval_token'), data.get('approved'))
+        if request.path.endswith('/retry'):
+            result = title_worker.retry(session_id)
         else:
             result = save_title(session_id, data.get('title'))
         return jsonify(result)
@@ -440,6 +440,7 @@ def health():
 
 
 if __name__ == "__main__":
+    title_worker.start()
     app.run(
         host="127.0.0.1",
         port=8765,

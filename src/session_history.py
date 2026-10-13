@@ -7,7 +7,7 @@ from pathlib import Path
 
 
 from app_paths import RECORDINGS_DIR, OUTPUTS_DIR
-from session_titles import read_title
+from session_titles import read_title, read_title_job
 
 
 def get_recording_duration(recording, metadata_path):
@@ -121,7 +121,8 @@ def list_sessions():
             size_mb = 0
 
         sessions.append({
-            **(read_title(session_dir) if has_transcript else {}),
+            **read_title(session_dir),
+            **read_title_job(session_dir),
             "session_id": session_id,
             "status": status,
             "recording_path": str(recording) if has_audio else None,
