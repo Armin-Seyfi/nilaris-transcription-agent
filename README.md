@@ -106,7 +106,8 @@ another AI request; notes remain available after audio-only cleanup.
 
 The dominant spoken language determines narrative language, localized headings,
 and Word formatting: Persian uses RTL paragraphs and tables; English and German
-use LTR. Dates follow the existing Berlin recording metadata, with Jalali and
+use LTR. Legacy Persian Word documents are repaired locally on their next
+download, retaining the prior file as a backup and making no AI request. Dates follow the existing Berlin recording metadata, with Jalali and
 Gregorian dates for Persian. Notes are interpretive AI output; the original
 transcript stays unchanged and should be consulted for consequential decisions.
 

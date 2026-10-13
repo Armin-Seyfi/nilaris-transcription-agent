@@ -121,6 +121,42 @@ class NotesTests(unittest.TestCase):
         bad=example();bad['actions'][0]['owner']=None
         with self.assertRaises(ValueError):notes.validate_notes(bad)
 
+    def test_word_alignment_follows_microsoft_bidi_semantics_in_every_paragraph(self):
+        for language in ('fa', 'en', 'de'):
+            doc = Document(BytesIO(create_notes_docx(example(language), {'session_id': SID})))
+            paragraphs = [p for p in doc.paragraphs if p.text]
+            paragraphs += [p for table in doc.tables for row in table.rows for cell in row.cells for p in cell.paragraphs if p.text]
+            for paragraph in paragraphs:
+                self.assertEqual(paragraph._p.pPr.find(qn('w:jc')).get(qn('w:val')), 'left')
+                self.assertEqual(paragraph._p.pPr.find(qn('w:bidi')).get(qn('w:val')), '1' if language == 'fa' else '0')
+
+    def test_legacy_persian_word_download_repairs_once_without_ai_and_preserves_backup(self):
+        data = example('fa')
+        record = {'notes': data, 'model': 'gpt-4o-mini', 'created_at': 'baseline'}
+        (self.folder/'ai_notes.json').write_text(json.dumps(record))
+        old = create_notes_docx(data, {'session_id': SID})
+        (self.folder/'ai_notes.docx').write_bytes(old)
+        manager = notes.NotesManager(request_fn=lambda *args: self.fail('Formatting must not call AI'))
+        with patch('notes_exporter.create_notes_docx', wraps=create_notes_docx) as render:
+            manager.download_document(SID)
+            manager.download_document(SID)
+            self.assertEqual(render.call_count, 1)
+        self.assertEqual((self.folder/'ai_notes.before-alignment.docx').read_bytes(), old)
+        saved = json.loads((self.folder/'ai_notes.json').read_text())
+        self.assertEqual(saved['notes'], data)
+        self.assertEqual(saved['created_at'], 'baseline')
+        self.assertEqual(saved['document_format_version'], 2)
+        self.assertEqual(hashlib.sha256(self.source.read_bytes()).hexdigest(), self.fingerprint)
+
+    def test_legacy_english_and_german_downloads_reuse_original_files(self):
+        for language in ('en', 'de'):
+            (self.folder/'ai_notes.json').write_text(json.dumps({'notes': example(language)}))
+            (self.folder/'ai_notes.docx').write_bytes(b'original cached Word')
+            manager = notes.NotesManager(request_fn=lambda *args: self.fail('No AI'))
+            with patch('notes_exporter.create_notes_docx') as render:
+                self.assertEqual(manager.download_document(SID).read_bytes(), b'original cached Word')
+                render.assert_not_called()
+
     def test_origin_download_and_storage_api(self):
         import web_server as web
         manager=notes.NotesManager(request_fn=lambda *args:example())

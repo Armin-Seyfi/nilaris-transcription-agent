@@ -95,7 +95,7 @@ def atomic_write(path, content):
 
 def notes_paths(session_id):
     folder = session_folder(session_id)
-    for name in ('ai_notes.json', 'ai_notes.docx', 'ai_notes_job.json', 'ai_notes_chunks.json', 'ai_notes_result.json'):
+    for name in ('ai_notes.json', 'ai_notes.docx', 'ai_notes_job.json', 'ai_notes_chunks.json', 'ai_notes_result.json', 'ai_notes.before-alignment.docx'):
         _check_safe_path(folder/name, OUTPUTS_DIR)
     return folder
 
@@ -180,6 +180,30 @@ class NotesManager:
                 raise
             return {'state': 'generating', 'session_id': session_id}
 
+    def download_document(self, session_id):
+        """Repair legacy Persian formatting locally once, without any inference."""
+        from notes_exporter import create_notes_docx, DOCUMENT_FORMAT_VERSION
+        with self.guard:
+            folder = notes_paths(session_id)
+            document_path = folder/'ai_notes.docx'
+            record_path = folder/'ai_notes.json'
+            if not document_path.is_file() or not record_path.is_file():
+                raise FileNotFoundError('Generate AI notes before downloading.')
+            record = read_json(record_path)
+            data = validate_notes(record['notes'])
+            if data['language'] == 'fa' and record.get('document_format_version', 1) < DOCUMENT_FORMAT_VERSION:
+                metadata_path = folder/'session_metadata.json'
+                _check_safe_path(metadata_path, OUTPUTS_DIR)
+                metadata = read_json(metadata_path) if metadata_path.is_file() else {}
+                metadata['session_id'] = session_id
+                content = create_notes_docx(data, metadata)
+                backup = folder/'ai_notes.before-alignment.docx'
+                if not backup.exists(): atomic_write(backup, document_path.read_bytes())
+                atomic_write(document_path, content)
+                record['document_format_version'] = DOCUMENT_FORMAT_VERSION
+                atomic_write(record_path, json.dumps(record, ensure_ascii=False, indent=2).encode())
+            return document_path
+
     def _job(self, folder, state, **fields):
         atomic_write(folder/'ai_notes_job.json', json.dumps({'state': state, **fields}, ensure_ascii=False).encode())
 
@@ -212,7 +236,7 @@ class NotesManager:
             if notes['language'] == 'other': raise ValueError('Notes currently support Persian, English and German. This recording uses another dominant language.')
             atomic_write(result_path, json.dumps({'fingerprint': fingerprint, 'model': MODEL,
                 'prompt_version': PROMPT_VERSION, 'notes': notes}, ensure_ascii=False).encode())
-            from notes_exporter import create_notes_docx
+            from notes_exporter import create_notes_docx, DOCUMENT_FORMAT_VERSION
             metadata_path = folder/'session_metadata.json'
             _check_safe_path(metadata_path, OUTPUTS_DIR)
             metadata = read_json(metadata_path) if metadata_path.is_file() else {'session_id': session_id}
@@ -222,7 +246,7 @@ class NotesManager:
                 notes_paths(session_id)
                 current = hashlib.sha256((folder/'transcript.json').read_bytes()).hexdigest()
                 if current != fingerprint: raise RuntimeError('Transcript changed during generation. Notes were not saved.')
-                record = {'notes': notes, 'transcript_sha256': fingerprint, 'model': MODEL, 'prompt_version': PROMPT_VERSION, 'created_at': datetime.now(timezone.utc).isoformat()}
+                record = {'notes': notes, 'transcript_sha256': fingerprint, 'model': MODEL, 'prompt_version': PROMPT_VERSION, 'created_at': datetime.now(timezone.utc).isoformat(), 'document_format_version': DOCUMENT_FORMAT_VERSION}
                 atomic_write(folder/'ai_notes.docx', document)
                 atomic_write(folder/'ai_notes.json', json.dumps(record, ensure_ascii=False, indent=2).encode())
                 self._job(folder, 'ready')

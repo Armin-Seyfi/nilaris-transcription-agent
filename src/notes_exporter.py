@@ -8,6 +8,8 @@ from docx.oxml import OxmlElement
 from docx.oxml.ns import qn
 from transcript_exporter import add_paragraph, set_text_direction, get_start_datetime, format_dates, format_duration
 
+DOCUMENT_FORMAT_VERSION = 2
+
 LABELS = {
  'en': ['AI Generated Notes', 'Content type', 'Overview', 'Key topics', 'Decisions', 'Actions and plans', 'Open questions', 'Highlights and ideas', 'Uncertainties', 'Action or plan', 'Owner', 'Timeline', 'Context', 'Not specified', 'AI generated from the saved transcript. Review important decisions and actions against the original recording.'],
  'fa': ['یادداشت‌های تولیدشده با هوش مصنوعی', 'نوع محتوا', 'خلاصه', 'موضوعات اصلی', 'تصمیم‌ها', 'اقدام‌ها و برنامه‌ها', 'پرسش‌های باز', 'نکات و ایده‌های برجسته', 'ابهام‌ها', 'اقدام یا برنامه', 'مسئول', 'زمان‌بندی', 'توضیحات', 'مشخص نشده', 'این یادداشت‌ها با هوش مصنوعی از رونوشت ذخیره‌شده تولید شده‌اند. تصمیم‌ها و اقدام‌های مهم را با ضبط اصلی بررسی کنید.'],
@@ -16,7 +18,9 @@ LABELS = {
 
 def direction(paragraph, rtl):
     set_text_direction(paragraph, rtl)
-    paragraph.alignment = WD_ALIGN_PARAGRAPH.RIGHT if rtl else WD_ALIGN_PARAGRAPH.LEFT
+    # Word interprets jc left/right relative to bidi: left + bidi=1 is
+    # visually flush right. See MS-OE376 2.1.49 (paragraph alignment).
+    paragraph.alignment = WD_ALIGN_PARAGRAPH.LEFT
     for run in paragraph.runs:
         run.font.name = 'Arial'
         run.font.color.rgb = RGBColor(0,0,0)

@@ -213,8 +213,8 @@ def download_session_notes(session_id):
         state = notes_manager.status(session_id)
         if state['state'] != 'ready':
             return jsonify({'error': 'Generate AI notes before downloading.'}), 409
-        folder = notes_paths(session_id)
-        return send_file(folder/'ai_notes.docx', as_attachment=True,
+        document_path = notes_manager.download_document(session_id)
+        return send_file(document_path, as_attachment=True,
             mimetype='application/vnd.openxmlformats-officedocument.wordprocessingml.document',
             download_name=f"{session_id}_ai_notes_{state['language']}.docx")
     except FileNotFoundError as error:
