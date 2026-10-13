@@ -4,6 +4,7 @@ import sys
 from datetime import datetime, timezone
 from pathlib import Path
 from zoneinfo import ZoneInfo
+from capture_metadata import load_capture_metadata
 
 
 def get_audio_duration(audio_path):
@@ -47,6 +48,8 @@ def create_session_metadata(recording_path):
     if not session_dir.is_dir():
         raise FileNotFoundError(session_dir)
 
+    capture = load_capture_metadata(recording)
+
     metadata = {
         "session_id": recording.stem,
         "display_name": start_local.strftime(
@@ -60,9 +63,10 @@ def create_session_metadata(recording_path):
         ),
         "recording_file": recording.name,
         "audio_sources": {
-            "LOCAL": "Mac microphone",
-            "REMOTE": "System audio / BlackHole"
+            "LOCAL": capture["microphone"]["name"],
+            "REMOTE": capture["blackhole"]["name"]
         },
+        "capture": capture,
         "transcription_model": "whisper-1",
         "chunk_duration_target_seconds": 300,
         "transcription_status": "not_started",

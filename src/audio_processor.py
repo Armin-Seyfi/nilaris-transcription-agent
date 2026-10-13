@@ -3,6 +3,7 @@ import subprocess
 import sys
 
 from app_paths import OUTPUTS_DIR as OUTPUT_DIR
+from capture_metadata import load_capture_metadata, stream_filters
 
 
 def process_recording(recording_path, chunk_seconds=300):
@@ -20,10 +21,8 @@ def process_recording(recording_path, chunk_seconds=300):
 
     print(f"\nProcessing: {recording_path.name}", flush=True)
 
-    streams = {
-        "local": "pan=mono|c0=c2,highpass=f=100",
-        "remote": "pan=mono|c0=0.5*c0+0.5*c1",
-    }
+    capture = load_capture_metadata(recording_path)
+    streams = stream_filters(capture)
 
     results = {}
 
@@ -35,6 +34,7 @@ def process_recording(recording_path, chunk_seconds=300):
 
         command = [
             "ffmpeg",
+            "-n",
             "-hide_banner",
             "-loglevel", "error",
             "-i", str(recording_path),

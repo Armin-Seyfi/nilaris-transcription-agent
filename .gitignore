@@ -21,3 +21,18 @@ outputs/
 
 # Jupyter
 .ipynb_checkpoints/
+
+# Native capture and private session metadata
+*.caf
+*.capture.json
+*.title.json
+*.title-job.json
+update_backups/
+review/
+
+# Local development backups and experiments
+*_backup.py
+*_before_*.py
+*_before_*.swift
+*.before-*
+native_*_test.swift

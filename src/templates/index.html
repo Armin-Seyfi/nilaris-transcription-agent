@@ -400,7 +400,8 @@
 
                 remainingEl.textContent =
                     data.state === "recording"
-                    ? `Remaining: ${formatTime(data.remaining_seconds)}`
+                    ? `Remaining: ${formatTime(data.remaining_seconds)}` +
+                      (data.listening_device ? ` · Listening: ${data.listening_device}` : "")
                     : `Maximum duration: ${formatTime(max)}`;
 
                 startButton.hidden =
@@ -456,8 +457,10 @@
             messageEl.textContent = "Starting audio recorder...";
 
             try {
-                await postAction("/api/recording/start");
-                messageEl.textContent = "Recording in progress.";
+                const recording = await postAction("/api/recording/start");
+                messageEl.textContent = recording.listening_device
+                    ? `Recording in progress. Listening through ${recording.listening_device}.`
+                    : "Recording in progress.";
             } catch (error) {
                 messageEl.textContent = error.message;
             } finally {
@@ -552,6 +555,8 @@
             }
         };
 
+        let lastRefreshedTranscriptSession = null;
+
         async function refreshProcessingStatus() {
             try {
                 const response = await fetch(
@@ -615,6 +620,11 @@
                     } else if (job.state === "completed") {
                         processingMessage.textContent =
                             "Transcription completed. Transcript saved locally.";
+
+                        if (modalSessionId !== lastRefreshedTranscriptSession) {
+                            lastRefreshedTranscriptSession = modalSessionId;
+                            await refreshSessionHistory();
+                        }
 
                     } else if (job.state === "failed") {
                         processingMessage.textContent =

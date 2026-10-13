@@ -6,6 +6,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 from app_paths import PROJECT_ROOT, DATA_ROOT, RECORDINGS_DIR
+from capture_metadata import load_capture_metadata
 SWIFT_RECORDER = PROJECT_ROOT / "src" / "native_recorder.swift"
 
 READY_SIGNAL = "NILARIS_READY"
@@ -34,12 +35,21 @@ class RecordingController:
         self.last_recovery = None
         self.auto_stopped = False
         self.stop_requested = False
+        self.listening_device = None
+        self.route_warning = None
+        self.reader_thread = None
 
     def _read_output(self, process):
         """Read Swift output continuously and detect recorder readiness."""
         for line in process.stdout:
             line = line.rstrip()
             self.output_lines.append(line)
+
+            if line.startswith("NILARIS_ROUTE_WARNING: "):
+                self.route_warning = line.removeprefix("NILARIS_ROUTE_WARNING: ")
+
+            if line.startswith("NILARIS_OUTPUT: "):
+                self.listening_device = line.removeprefix("NILARIS_OUTPUT: ")
 
             if line == READY_SIGNAL:
                 self.ready_event.set()
@@ -62,6 +72,8 @@ class RecordingController:
             self.auto_stopped = False
             self.stop_requested = False
             self.last_completed_recording = None
+            self.listening_device = None
+            self.route_warning = None
 
             process = subprocess.Popen(
                 ["swift", str(SWIFT_RECORDER)],
@@ -75,11 +87,12 @@ class RecordingController:
 
             self.process = process
 
-            threading.Thread(
+            self.reader_thread = threading.Thread(
                 target=self._read_output,
                 args=(process,),
                 daemon=True,
-            ).start()
+            )
+            self.reader_thread.start()
 
         deadline = time.monotonic() + STARTUP_TIMEOUT
 
@@ -117,6 +130,11 @@ class RecordingController:
                             process.kill()
                             process.wait()
 
+            if self.reader_thread:
+                self.reader_thread.join(timeout=2)
+
+            self._restore_audio_route()
+
             if process.stdin:
                 process.stdin.close()
 
@@ -131,6 +149,17 @@ class RecordingController:
             "Recorder startup failed or timed out.\n"
             f"Recent Swift output:\n{details}"
         )
+
+    def _restore_audio_route(self):
+        """Recover only this recorder's journal; respect an output chosen by the user."""
+        if not (DATA_ROOT / "audio_route_recovery.json").exists():
+            return
+        result = subprocess.run(
+            ["swift", str(SWIFT_RECORDER), "--recover-route"],
+            cwd=DATA_ROOT, capture_output=True, text=True, timeout=60,
+        )
+        if result.returncode != 0:
+            raise RuntimeError("Audio route recovery needs attention: " + result.stdout[-2000:])
 
     def _recording_watchdog(self, process):
         """Automatically stop and save at the recording duration limit."""
@@ -210,10 +239,11 @@ class RecordingController:
                 ),
                 "max_duration_seconds": self.max_duration_seconds,
                 "pid": self.process.pid,
+                "listening_device": self.listening_device,
                 "error": (
                     "Audio write failure"
                     if state == "error" and any(
-                        "NILARIS_AUDIO_WRITE_ERROR" in line
+                        ("NILARIS_AUDIO_WRITE_ERROR" in line or "NILARIS_AUDIO_ERROR" in line)
                         for line in self.output_lines
                     )
                     else "Recorder exited unexpectedly"
@@ -229,6 +259,7 @@ class RecordingController:
             if self.process is None or self.process.poll() is None:
                 raise RuntimeError("No stopped recorder to recover.")
 
+            self._restore_audio_route()
             exit_code = self.process.returncode
 
             new_files = sorted(
@@ -278,6 +309,9 @@ class RecordingController:
 
             return_code = process.wait(timeout=30)
             process.stdin.close()
+            if self.reader_thread:
+                self.reader_thread.join(timeout=2)
+            self._restore_audio_route()
 
             if return_code != 0:
                 raise RuntimeError(
@@ -294,10 +328,14 @@ class RecordingController:
                 )
 
             recording_path = new_files.pop()
+            capture = load_capture_metadata(recording_path)
 
             result = {
                 "state": "completed",
                 "recording_path": str(recording_path),
+                "duration_seconds": capture["duration_seconds"],
+                "route_warning": self.route_warning,
+                "listening_device": self.listening_device,
                 "file_size_mb": round(
                     recording_path.stat().st_size / 1024 / 1024, 2
                 ),

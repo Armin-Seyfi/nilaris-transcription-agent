@@ -21,11 +21,13 @@ def get_session_files(session_id):
         raise ValueError("Invalid session ID.")
 
     recording = RECORDINGS_DIR / f"{session_id}.caf"
+    capture_metadata = RECORDINGS_DIR / f"{session_id}.capture.json"
     session_dir = OUTPUTS_DIR / f"{session_id}_separated"
     legacy_dir = OUTPUTS_DIR / session_id
 
     if (
         recording.is_symlink()
+        or capture_metadata.is_symlink()
         or session_dir.is_symlink()
         or legacy_dir.is_symlink()
     ):
@@ -52,6 +54,7 @@ def get_session_files(session_id):
     return {
         "session_id": session_id,
         "recording": str(recording) if has_audio else None,
+        "capture_metadata": str(capture_metadata) if capture_metadata.is_file() else None,
         "session_directory": str(session_dir) if has_outputs else None,
         "legacy_directory": str(legacy_dir) if has_legacy_outputs else None,
         "has_audio": has_audio,
@@ -202,6 +205,11 @@ def trash_entire_session(session_id):
         recording = Path(session["recording"])
         _check_safe_path(recording, RECORDINGS_DIR)
         paths.append(recording)
+
+    if session["capture_metadata"]:
+        capture_metadata = Path(session["capture_metadata"])
+        _check_safe_path(capture_metadata, RECORDINGS_DIR)
+        paths.append(capture_metadata)
 
     if session["session_directory"]:
         session_dir = Path(session["session_directory"])
