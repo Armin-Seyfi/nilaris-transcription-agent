@@ -296,7 +296,7 @@ func verifyInputUnit(_ unit: AudioUnit, _ selected: AudioDeviceID) throws {
     var bound: AudioDeviceID = 0, size = UInt32(MemoryLayout<AudioDeviceID>.size)
     try checked(AudioUnitGetProperty(unit, kAudioOutputUnitProperty_CurrentDevice,
         kAudioUnitScope_Global, 0, &bound, &size), "Verify active recorder input")
-    guard bound == selected else { throw AudioFailure("Recorder input changed") }
+    guard bound == selected else { throw AudioFailure("Recorder input changed: expected device \(selected), observed \(bound)") }
     var map = [Int32](repeating: -1, count: 3), mapSize = UInt32(3 * MemoryLayout<Int32>.size)
     let status = map.withUnsafeMutableBytes {
         AudioUnitGetProperty(unit, kAudioOutputUnitProperty_ChannelMap, kAudioUnitScope_Output,
@@ -346,8 +346,10 @@ func record() throws {
         do { try route.restore(); print("NILARIS_ROUTE_RESTORED") }
         catch { print("NILARIS_ROUTE_WARNING: \(error)") }; fflush(stdout)
     }
-    let engine = AVAudioEngine(), input = engine.inputNode
-    guard let unit = input.audioUnit else { throw AudioFailure("Input AudioUnit unavailable") }
+    var engine = AVAudioEngine()
+    var input = engine.inputNode
+    guard let initialUnit = input.audioUnit else { throw AudioFailure("Input AudioUnit unavailable") }
+    var unit = initialUnit
     var selected = plan.aggregate.id
     try checked(AudioUnitSetProperty(unit, kAudioOutputUnitProperty_CurrentDevice, kAudioUnitScope_Global, 0,
         &selected, UInt32(MemoryLayout<AudioDeviceID>.size)), "Bind recorder input")
@@ -456,9 +458,9 @@ func record() throws {
         }
         state.stop() // Parent exited: preserve audio and restore output.
     }
-    let observer = NotificationCenter.default.addObserver(forName: .AVAudioEngineConfigurationChange,
+    var observer: NSObjectProtocol? = NotificationCenter.default.addObserver(forName: .AVAudioEngineConfigurationChange,
         object: engine, queue: nil) { _ in state.configurationChanged() }
-    defer { NotificationCenter.default.removeObserver(observer) }
+    defer { if let observer { NotificationCenter.default.removeObserver(observer) } }
     do {
         try engine.start()
         try verifyInputUnit(unit, selected)
@@ -507,8 +509,14 @@ func record() throws {
                         "started_at": ISO8601DateFormatter().string(from: Date()),
                         "reason": listenerLost ? "listening_device_disconnected" : "audio_engine_configuration_changed"]
                     recoveryEvents.append(event)
-                    metadata["output_recoveries"] = recoveryEvents
-                    try writeJSON(metadata, to: metadataURL)
+                    func markRecoveryStage(_ stage: String) throws {
+                        event["stage"] = stage
+                        recoveryEvents[recoveryEvents.count - 1] = event
+                        metadata["output_recoveries"] = recoveryEvents
+                        try writeJSON(metadata, to: metadataURL)
+                        print("NILARIS_RECOVERY_STAGE: \(stage)"); fflush(stdout)
+                    }
+                    try markRecoveryStage("replace_playback_route")
                     if listenerLost {
                         let destination = try disconnectedListenerFallback(devices())
                         try route.restore()
@@ -520,10 +528,32 @@ func record() throws {
                             throw AudioFailure("Output was manually changed; partial recording preserved")
                         }
                     }
-                    // An output change can reset AVAudioEngine's input AudioUnit.
-                    // Rebind it to the original, independently verified capture layout.
+                    // A disconnected Bluetooth device can invalidate the old engine's
+                    // cached AUHAL. Do not keep rebinding that old AudioUnit: build a
+                    // fresh graph using the same binding sequence as a cold start.
+                    try markRecoveryStage("create_fresh_capture_engine")
+                    if let oldObserver = observer {
+                        NotificationCenter.default.removeObserver(oldObserver); observer = nil
+                    }
+                    engine = AVAudioEngine()
+                    input = engine.inputNode
+                    guard let replacementUnit = input.audioUnit else {
+                        throw AudioFailure("Replacement input AudioUnit unavailable")
+                    }
+                    unit = replacementUnit
+                    try verifySameCapture(plan, capturePlan(devices()))
+                    try markRecoveryStage("bind_fresh_capture_input")
                     try checked(AudioUnitSetProperty(unit, kAudioOutputUnitProperty_CurrentDevice,
                         kAudioUnitScope_Global, 0, &selected, UInt32(MemoryLayout<AudioDeviceID>.size)), "Rebind input after output change")
+                    var restoredHardware = AudioStreamBasicDescription()
+                    var restoredHardwareSize = UInt32(MemoryLayout<AudioStreamBasicDescription>.size)
+                    try checked(AudioUnitGetProperty(unit, kAudioUnitProperty_StreamFormat,
+                        kAudioUnitScope_Input, 1, &restoredHardware, &restoredHardwareSize),
+                        "Read replacement input hardware format")
+                    guard restoredHardware.mChannelsPerFrame == 3,
+                          abs(restoredHardware.mSampleRate - plan.sampleRate) < 1 else {
+                        throw AudioFailure("Replacement hardware format disagrees with fixed capture mapping")
+                    }
                     var restoredClient = captureClientDescription(sampleRate: plan.sampleRate, channels: 3)
                     try checked(AudioUnitSetProperty(unit, kAudioUnitProperty_StreamFormat,
                         kAudioUnitScope_Output, 1, &restoredClient, UInt32(MemoryLayout<AudioStreamBasicDescription>.size)),
@@ -535,13 +565,18 @@ func record() throws {
                     try checked(restoredMap, "Restore channel mapping after output change")
                     let restoredFormat = input.outputFormat(forBus: 0)
                     guard restoredFormat.channelCount == format.channelCount,
+                          restoredFormat.commonFormat == .pcmFormatFloat32, !restoredFormat.isInterleaved,
                           abs(restoredFormat.sampleRate - format.sampleRate) < 1 else {
                         throw AudioFailure("Capture format could not be restored; partial audio preserved")
                     }
                     try verifyInputUnit(unit, selected)
+                    try markRecoveryStage("start_fresh_capture_engine")
                     installAudioTap()
+                    observer = NotificationCenter.default.addObserver(forName: .AVAudioEngineConfigurationChange,
+                        object: engine, queue: nil) { _ in state.configurationChanged() }
                     let restartedAt = ProcessInfo.processInfo.systemUptime
                     try engine.start()
+                    try markRecoveryStage("verify_fresh_input_and_buffers")
                     var stable = false
                     var stableGeneration = -1
                     while ProcessInfo.processInfo.systemUptime < deadline {
@@ -584,7 +619,9 @@ func record() throws {
                     handledGeneration = state.configurationGeneration
                     state.paused = false
                     state.lock.unlock()
-                    event["status"] = "resumed"; event["to_listener"] = listener.json
+                    event["status"] = "resumed"; event["stage"] = "complete"
+                    event["capture_engine_recreated"] = true
+                    event["to_listener"] = listener.json
                     event["gap_frames"] = gapFrames
                     event["gap_seconds"] = Double(gapFrames) / format.sampleRate
                     event["gap_content"] = "inserted_silence_no_audio_recovered"
@@ -691,8 +728,12 @@ func record() throws {
             recoveryEvents[recoveryEvents.count - 1]["status"] = "failed"
             metadata["output_recoveries"] = recoveryEvents
         }
-        metadata["status"] = "failed"; metadata["captured_frames"] = frames; metadata["error"] = String(describing: error)
-        try? writeJSON(metadata, to: metadataURL); throw error
+        metadata["status"] = "failed"; metadata["captured_frames"] = frames
+        let stage = recoveryEvents.last?["stage"] as? String
+        let detail = String(describing: error) + (stage.map { " [recovery stage: \($0)]" } ?? "")
+        metadata["error"] = detail
+        try? writeJSON(metadata, to: metadataURL)
+        throw AudioFailure(detail)
     }
 }
 func outputSnapshot(_ device: Device) -> [String: Any] {

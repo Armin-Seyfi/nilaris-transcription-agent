@@ -97,8 +97,11 @@ hardware compatibility. Headphone disconnection is handled by the bounded recove
 
 If the selected listening device disappears, the recorder pauses file writes,
 verifies the original input aggregate and channel order, replaces its temporary
-playback route with BlackHole plus built-in speakers, and explicitly rebinds the
-input AudioUnit. Configuration notifications pause writes instead of immediately
+playback route with BlackHole plus built-in speakers, and recreates the capture engine, input node and AudioUnit using the same
+explicit binding sequence as a cold start. The previous engine can retain an
+invalid/default-device AUHAL after Bluetooth removal; rebinding that old handle
+alone failed in on-device tests. Recovery stages are saved in the capture sidecar
+to identify any further hardware-specific failure. Configuration notifications pause writes instead of immediately
 terminating the session. Recording resumes only after mapped input buffers and
 the managed playback route have been checked. Other input layout changes remain
 fatal; original partial audio is preserved.
