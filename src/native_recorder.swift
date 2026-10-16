@@ -123,12 +123,18 @@ func capturePlan(_ inventory: [Device]) throws -> CapturePlan {
                        remote: remote, orderedUIDs: order, sampleRate: rate)
 }
 func chooseListeningDevice(_ inventory: [Device], current: AudioObjectID) throws -> Device {
-    let physical = inventory.filter { $0.outputChannels == 2 &&
+    // Bluetooth call mode can expose a one-channel output. It is still a
+    // listening device; excluding it silently redirected the user to speakers.
+    let physical = inventory.filter { (1...2).contains($0.outputChannels) &&
         [kAudioDeviceTransportTypeBuiltIn, kAudioDeviceTransportTypeUSB,
          kAudioDeviceTransportTypeBluetooth, kAudioDeviceTransportTypeBluetoothLE].contains($0.transport) }
     let bluetooth = physical.filter {
         [kAudioDeviceTransportTypeBluetooth, kAudioDeviceTransportTypeBluetoothLE].contains($0.transport) }
     if let d = bluetooth.first(where: { $0.id == current }) { return d }
+    // Preserve the explicitly selected Bluetooth endpoint, including mono.
+    // Without a selected endpoint prefer one unambiguous stereo profile.
+    let stereoBluetooth = bluetooth.filter { $0.outputChannels == 2 }
+    if stereoBluetooth.count == 1 { return stereoBluetooth[0] }
     if bluetooth.count == 1 { return bluetooth[0] }
     if bluetooth.count > 1 { throw AudioFailure("Multiple Bluetooth outputs; cannot choose safely") }
     if let d = physical.first(where: { $0.id == current }) { return d }
@@ -616,6 +622,14 @@ func selfTest() throws {
     }
     try expect(try chooseListeningDevice([speaker], current: 99).id == 1)
     try expect(try chooseListeningDevice([speaker, headset, handsFree], current: 1).id == 2)
+    // Regression: the user's WH-1000XM4 reported one output channel and was
+    // the system default. It must never be discarded in favour of speakers.
+    try expect(try chooseListeningDevice([speaker, handsFree], current: 3).id == 3)
+    try expect(try chooseListeningDevice([speaker, headset, handsFree], current: 3).id == 3)
+    try expect(try chooseListeningDevice([speaker, handsFree], current: 99).id == 3)
+    let bluetoothInput = fixture(6, kAudioDeviceTransportTypeBluetooth, 0)
+    try expect(try chooseListeningDevice([speaker, bluetoothInput, handsFree], current: 3).id == 3)
+    try expect(try chooseListeningDevice([speaker, bluetoothInput], current: 1).id == 1)
     try expect(try chooseListeningDevice([speaker, usb], current: 4).id == 4)
     try expect(try chooseListeningDevice([speaker, headset, otherHeadset], current: 5).id == 5)
     do {
@@ -624,7 +638,7 @@ func selfTest() throws {
     } catch let error as AudioFailure {
         guard error.description.contains("Multiple Bluetooth") else { throw error }
     }
-    print("NILARIS_SELF_TEST_PASS: fourteen startup/format/policy/composition checks; no settings changed")
+    print("NILARIS_SELF_TEST_PASS: startup/format/policy/composition checks including mono Bluetooth; no settings changed")
 }
 do {
     if CommandLine.arguments.contains("--self-test") {

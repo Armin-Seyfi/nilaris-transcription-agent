@@ -75,3 +75,20 @@ used to install reversible incremental updates on the development machine.
    preserved partial CAF, and sensible output recovery; acknowledge the error.
 5. Keep completed baseline sessions unchanged. Validate the new prepare flow,
    TXT/DOCX export and session history separately, without re-transcribing baselines.
+
+
+### Mono Bluetooth playback endpoints
+
+Some WH-1000XM4 configurations expose a one-channel Bluetooth output. The
+recorder accepts one- or two-channel physical playback devices and preserves the
+currently selected Bluetooth endpoint, including mono. Input-only Bluetooth
+devices remain excluded. When no Bluetooth endpoint is selected, one unambiguous
+stereo endpoint is preferred. Existing aggregate membership, drift, channel
+mapping and route restoration checks remain in force. The change does not force
+a Bluetooth profile or activate the headset microphone.
+
+The regression reproduces a selected mono headset alongside built-in speakers
+and checks that the headset is retained. Actual playback and BlackHole signal
+need a short on-device recording test; policy fixtures alone do not establish
+hardware compatibility. A disconnect during recording still ends capture rather
+than silently changing the input layout.
