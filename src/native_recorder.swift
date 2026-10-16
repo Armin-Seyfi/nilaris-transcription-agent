@@ -179,10 +179,10 @@ final class OutputRoute {
     let deviceUID = "org.nilaris.output.\(UUID().uuidString)"
     var id: AudioObjectID = 0
     var closed = false
-    init(_ plan: CapturePlan, _ listener: Device, journal: URL) throws {
+    init(_ plan: CapturePlan, _ listener: Device, journal: URL, restoreUID: String? = nil) throws {
         self.journal = journal; self.listener = listener
         let previous: AudioObjectID = try value(systemObject, kAudioHardwarePropertyDefaultOutputDevice, AudioObjectID.self)
-        previousUID = try stringValue(previous, kAudioDevicePropertyDeviceUID)
+        previousUID = try restoreUID ?? stringValue(previous, kAudioDevicePropertyDeviceUID)
         let clockUID = listener.transport == kAudioDeviceTransportTypeBuiltIn ? listener.uid : plan.blackhole.uid
         // Match the working Multi-Output: stacked=true; public so apps follow the default.
         let composition: [String: Any] = [
@@ -303,6 +303,40 @@ func disconnectedListenerFallback(_ inventory: [Device]) throws -> Device {
     let speakers = inventory.filter { $0.transport == kAudioDeviceTransportTypeBuiltIn && $0.outputChannels == 2 }
     guard speakers.count == 1 else { throw AudioFailure("Cannot identify built-in speakers for output recovery") }
     return speakers[0]
+}
+struct PlaybackTransition {
+    let destination: Device
+    let reason: String
+}
+func isBluetoothPlayback(_ device: Device) -> Bool {
+    (1...2).contains(device.outputChannels) &&
+        [kAudioDeviceTransportTypeBluetooth, kAudioDeviceTransportTypeBluetoothLE].contains(device.transport)
+}
+final class PlaybackTransitionPolicy {
+    private(set) var pendingUID: String?
+    private var seenAt: Double = 0
+    let connectionSettleSeconds = 0.8
+    func proposal(_ inventory: [Device], listener: Device, currentOutput: AudioDeviceID,
+                  now: Double) throws -> PlaybackTransition? {
+        if !inventory.contains(where: { $0.uid == listener.uid && $0.outputChannels > 0 }) {
+            pendingUID = nil
+            return PlaybackTransition(destination: try disconnectedListenerFallback(inventory),
+                reason: "listening_device_disconnected")
+        }
+        // Never abandon a working Bluetooth/USB listener merely because another
+        // device appeared. Auto-connect applies to the built-in-speaker state.
+        guard listener.transport == kAudioDeviceTransportTypeBuiltIn,
+              inventory.contains(where: isBluetoothPlayback),
+              let candidate = try? chooseListeningDevice(inventory, current: currentOutput),
+              isBluetoothPlayback(candidate), candidate.uid != listener.uid else {
+            pendingUID = nil; return nil
+        }
+        if pendingUID != candidate.uid {
+            pendingUID = candidate.uid; seenAt = now; return nil
+        }
+        guard now - seenAt >= connectionSettleSeconds else { return nil }
+        return PlaybackTransition(destination: candidate, reason: "bluetooth_headphones_connected")
+    }
 }
 typealias CapturePropertySetter = (AudioUnit, AudioUnitPropertyID, AudioUnitScope,
     AudioUnitElement, UnsafeRawPointer, UInt32) -> OSStatus
@@ -459,6 +493,7 @@ func record() throws {
     let state = CaptureState()
     var capture: FixedInputCapture?
     var events: [[String: Any]] = []
+    let playbackPolicy = PlaybackTransitionPolicy()
     defer { capture?.close() }
     signal(SIGTERM, SIG_IGN); signal(SIGINT, SIG_IGN)
     let term = DispatchSource.makeSignalSource(signal: SIGTERM, queue: .global())
@@ -502,22 +537,27 @@ func record() throws {
             if ProcessInfo.processInfo.systemUptime - began > 9 * 3600 {
                 print("NILARIS_AUTO_STOP: Hard limit reached"); break
             }
-            if !available.contains(where: { $0.uid == listener.uid && $0.outputChannels > 0 }) {
-                guard events.count < 6 else { throw AudioFailure("Repeated playback changes; partial recording preserved") }
+            let currentOutput: AudioObjectID = try value(systemObject, kAudioHardwarePropertyDefaultOutputDevice, AudioObjectID.self)
+            if let transition = try playbackPolicy.proposal(available, listener: listener,
+                currentOutput: currentOutput, now: ProcessInfo.processInfo.systemUptime) {
+                guard events.count < 12 else { throw AudioFailure("Repeated playback changes; partial recording preserved") }
                 state.lock.lock(); let fromFrame = state.frames; state.lock.unlock()
                 var event: [String: Any] = ["status": "recovering", "stage": "replace_playback_route",
-                    "reason": "listening_device_disconnected", "from_listener": listener.json,
+                    "reason": transition.reason, "from_listener": listener.json,
                     "audio_offset_seconds": Double(fromFrame) / plan.sampleRate,
                     "started_at": ISO8601DateFormatter().string(from: Date()), "silence_inserted": false]
                 events.append(event); metadata["output_recoveries"] = events
                 try writeJSON(metadata, to: metadataURL)
-                print("NILARIS_ROUTE_WARNING: Headphones disconnected; switching playback to speakers")
+                print("NILARIS_ROUTE_WARNING: Switching playback to \(transition.destination.name); capture stays on the verified input")
                 fflush(stdout)
                 // The input-only unit stays on the capture aggregate while playback
                 // changes. Any silence at BlackHole is captured on the original clock.
-                let destination = try disconnectedListenerFallback(devices())
+                let destination = transition.destination
+                guard (try devices()).contains(where: { $0.uid == destination.uid && $0.outputChannels > 0 }) else {
+                    throw AudioFailure("Playback destination disappeared before switching")
+                }
                 try route.restore()
-                route = try OutputRoute(plan, destination, journal: journal)
+                route = try OutputRoute(plan, destination, journal: journal, restoreUID: destination.uid)
                 listener = destination
                 try verifySameCapture(plan, capturePlan(devices()))
                 try capture!.verify()
@@ -554,15 +594,19 @@ func record() throws {
                 if current != route.id {
                     // Default-output and device-alive notifications need not arrive
                     // together. Keep capturing while waiting briefly for removal.
-                    let settleUntil = ProcessInfo.processInfo.systemUptime + 0.8
-                    var stillPresent = true
+                    let settleUntil = ProcessInfo.processInfo.systemUptime + 1.5
+                    var automaticChangePending = false
                     repeat {
-                        stillPresent = (try devices()).contains { $0.uid == listener.uid && $0.outputChannels > 0 }
-                        if !stillPresent { break }
+                        let updated = try devices()
+                        let selected: AudioObjectID = try value(systemObject, kAudioHardwarePropertyDefaultOutputDevice, AudioObjectID.self)
+                        let proposed = try playbackPolicy.proposal(updated, listener: listener,
+                            currentOutput: selected, now: ProcessInfo.processInfo.systemUptime)
+                        automaticChangePending = proposed != nil || playbackPolicy.pendingUID != nil
+                        if automaticChangePending { break }
                         Thread.sleep(forTimeInterval: 0.05)
                     } while ProcessInfo.processInfo.systemUptime < settleUntil
-                    if !stillPresent { continue }
-                    throw AudioFailure("Output manually changed; partial audio preserved")
+                    if automaticChangePending { Thread.sleep(forTimeInterval: 0.1); continue }
+                    throw AudioFailure("Output manually changed outside supported automatic routing; partial audio preserved")
                 }
             }
             Thread.sleep(forTimeInterval: 0.25)
@@ -709,6 +753,22 @@ func selfTest() throws {
     } catch let error as AudioFailure {
         guard error.description.contains("Cannot identify built-in speakers") else { throw error }
     }
+    let playbackPolicy = PlaybackTransitionPolicy()
+    try expect(try playbackPolicy.proposal([speaker], listener: speaker, currentOutput: 99, now: 0) == nil)
+    try expect(try playbackPolicy.proposal([speaker, handsFree], listener: speaker, currentOutput: 99, now: 1) == nil)
+    try expect(try playbackPolicy.proposal([speaker, handsFree], listener: speaker, currentOutput: 99, now: 1.5) == nil)
+    let connection = try playbackPolicy.proposal([speaker, handsFree], listener: speaker, currentOutput: 99, now: 1.9)
+    try expect(connection?.destination.id == 3 && connection?.reason == "bluetooth_headphones_connected")
+    try expect(try playbackPolicy.proposal([speaker, handsFree], listener: handsFree, currentOutput: 99, now: 2) == nil)
+    let disconnection = try playbackPolicy.proposal([speaker], listener: handsFree, currentOutput: 99, now: 3)
+    try expect(disconnection?.destination.id == 1 && disconnection?.reason == "listening_device_disconnected")
+    // A brief appearance must not cause a switch, and ambiguous stereo headsets
+    // must not interrupt an otherwise healthy recording on speakers.
+    try expect(try playbackPolicy.proposal([speaker, handsFree], listener: speaker, currentOutput: 99, now: 4) == nil)
+    try expect(try playbackPolicy.proposal([speaker], listener: speaker, currentOutput: 99, now: 4.1) == nil)
+    try expect(try playbackPolicy.proposal([speaker, headset, otherHeadset], listener: speaker, currentOutput: 99, now: 5) == nil)
+    try expect(playbackPolicy.pendingUID == nil)
+    try expect(try playbackPolicy.proposal([speaker, headset, otherHeadset], listener: headset, currentOutput: 99, now: 6) == nil)
     let clientFixture = captureClientDescription(sampleRate: 48000, channels: 3)
     try expect(clientFixture.mSampleRate == 48000 && clientFixture.mChannelsPerFrame == 3)
     try expect(clientFixture.mBytesPerFrame == 4 && clientFixture.mBitsPerChannel == 32 &&
@@ -751,7 +811,7 @@ func selfTest() throws {
     } catch let error as AudioFailure {
         guard error.description.contains("Multiple Bluetooth") else { throw error }
     }
-    print("NILARIS_SELF_TEST_PASS: input-only AUHAL configuration, channel mapping and playback policy checks; no settings changed")
+    print("NILARIS_SELF_TEST_PASS: input-only AUHAL configuration, channel mapping and bidirectional playback policy checks; no settings changed")
 }
 do {
     if CommandLine.arguments.contains("--self-test") {

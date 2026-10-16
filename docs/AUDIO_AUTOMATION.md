@@ -112,7 +112,7 @@ with BlackHole plus built-in speakers. The input unit stays running and must
 retain its device and channel mapping; capture must advance across the playback
 transition before success is reported. Source layout changes, rendering errors
 and stalled buffers fail closed and preserve partial audio. Playback replacement
-is limited to six attempts per recording.
+is limited to twelve transitions per recording.
 
 A brief remote-audio interruption is possible while apps follow the new default
 output. No missing speech is reconstructed and no artificial silence is inserted:
@@ -121,9 +121,24 @@ Capture metadata records the transition interval, listener change, continuity
 check, and possible missing remote audio. UI warnings display the transition.
 The sidecar identifies this backend as independent_input_only_auhal_v1.
 
-Reconnecting headphones or manually selecting another output during recording
-is not an automatic return-to-headphones feature. Apps pinned to their own output
-device may not follow the new system route and need separate validation.
+While playback uses built-in speakers, an unambiguous Bluetooth endpoint that
+remains visible for at least 0.8 seconds triggers automatic switching to headphones.
+Both mono and stereo endpoints are supported. Input-only devices and transient
+connections are ignored. An already active Bluetooth or USB listener is not
+replaced merely because another headset appears. Ambiguous connections leave
+speaker playback alone unless the system default identifies a specific headset.
+
+The transition also tolerates the OS changing its default output while the new
+Bluetooth endpoint is becoming available. Other manual output changes are still
+unsupported. On stopping after an automatic handoff, the last selected physical
+listener is retained rather than restoring the speaker setting from before the
+headphones connected. Apps pinned to their own output device may not follow the
+new system route and need separate validation.
+
+On-device testing confirmed headphone-to-speaker fallback with capture advancing
+across a 0.352-second playback transition. The reverse direction is implemented
+and covered by deterministic policy tests; on-device reconnection validation is
+still pending.
 
 Offline tests exercise the actual input-only configuration helper with an injected
 CoreAudio property setter: input is enabled, playback is disabled, the explicit
