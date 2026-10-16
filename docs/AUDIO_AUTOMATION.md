@@ -135,10 +135,11 @@ listener is retained rather than restoring the speaker setting from before the
 headphones connected. Apps pinned to their own output device may not follow the
 new system route and need separate validation.
 
-On-device testing confirmed headphone-to-speaker fallback with capture advancing
-across a 0.352-second playback transition. The reverse direction is implemented
-and covered by deterministic policy tests; on-device reconnection validation is
-still pending.
+On-device testing confirmed both directions in one recording: built-in speakers
+to WH-1000XM4, then back to built-in speakers. Capture continued across both
+transitions, the recording completed, and transcription finalized with LOCAL and
+REMOTE segments. This validates the tested Mac/headset pairing, not every device
+or application output configuration.
 
 Offline tests exercise the actual input-only configuration helper with an injected
 CoreAudio property setter: input is enabled, playback is disabled, the explicit

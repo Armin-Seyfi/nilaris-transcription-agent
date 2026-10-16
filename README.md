@@ -15,7 +15,7 @@ the transcript text to OpenAI without an additional cost confirmation.
 | Capability | Behavior |
 | --- | --- |
 | Microphone + system capture | Explicit CoreAudio device binding and verified per-recording channel metadata |
-| Speaker/headphone routing | Temporary BlackHole + listening-device output; automatic headphone/speaker switching with independent input-only capture; reconnect hardware validation pending |
+| Speaker/headphone routing | Temporary BlackHole + listening-device output; automatic headphone/speaker switching with independent input-only capture; both directions verified in an on-device recording/transcription test |
 | Chunk preparation | Separate LOCAL/REMOTE streams; five-minute, mono 16 kHz, 64 kbps MP3 chunks |
 | Paid transcription control | Cost estimate and explicit Whisper approval; silent chunks skipped and cached results reused |
 | Timing | Chunk offsets retained; conservative boundary corrections with provenance in JSON |
