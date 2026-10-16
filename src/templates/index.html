@@ -399,7 +399,8 @@
                 remainingEl.textContent =
                     data.state === "recording"
                     ? `Remaining: ${formatTime(data.remaining_seconds)}` +
-                      (data.listening_device ? ` · Listening: ${data.listening_device}` : "")
+                      (data.listening_device ? ` · Listening: ${data.listening_device}` : "") +
+                      (data.route_warning ? ` · ${data.route_warning}` : "")
                     : `Maximum duration: ${formatTime(max)}`;
 
                 startButton.hidden =

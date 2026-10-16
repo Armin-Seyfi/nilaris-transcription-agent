@@ -267,16 +267,19 @@ final class CaptureState {
     var lastBuffer = Date(), error: String?, stopped = false, ready = false
     var localActiveBuffers = 0, duplicatedBuffers = 0
     var configurationGeneration = 0
+    var paused = false
+    var lastBufferUptime = ProcessInfo.processInfo.systemUptime
+    var lastObservedBufferUptime = ProcessInfo.processInfo.systemUptime
+    var lastObservedChannels: AVAudioChannelCount = 0
+    var lastObservedRate: Double = 0
     var lastConfigurationChange = Date()
     func fail(_ message: String) { lock.lock(); if error == nil { error = message }; lock.unlock() }
     func configurationChanged() {
         lock.lock()
-        if ready {
-            if error == nil { error = "Audio engine configuration changed; partial audio preserved" }
-        } else {
-            configurationGeneration += 1
-            lastConfigurationChange = Date()
-        }
+        // Freeze writes until the fixed input layout has been reverified.
+        configurationGeneration += 1
+        lastConfigurationChange = Date()
+        if ready { paused = true }
         lock.unlock()
     }
     func stop() { lock.lock(); stopped = true; lock.unlock() }
@@ -302,12 +305,43 @@ func verifyInputUnit(_ unit: AudioUnit, _ selected: AudioDeviceID) throws {
     try checked(status, "Verify active channel map")
     guard map == [0, 1, 2], mapSize == 12 else { throw AudioFailure("AudioUnit channel map changed") }
 }
+func verifySameCapture(_ expected: CapturePlan, _ observed: CapturePlan) throws {
+    guard observed.aggregate.uid == expected.aggregate.uid,
+          observed.orderedUIDs == expected.orderedUIDs,
+          observed.local == expected.local, observed.remote == expected.remote,
+          abs(observed.sampleRate - expected.sampleRate) < 1 else {
+        throw AudioFailure("Input layout changed; partial recording preserved")
+    }
+}
+func disconnectedListenerFallback(_ inventory: [Device]) throws -> Device {
+    let speakers = inventory.filter { $0.transport == kAudioDeviceTransportTypeBuiltIn && $0.outputChannels == 2 }
+    guard speakers.count == 1 else { throw AudioFailure("Cannot identify built-in speakers for output recovery") }
+    return speakers[0]
+}
+func writeRecoverySilence(_ file: AVAudioFile, _ format: AVAudioFormat, frames: Int64) throws {
+    guard frames >= 0, frames <= Int64(format.sampleRate * 15) else {
+        throw AudioFailure("Output recovery exceeded the permitted audio gap")
+    }
+    var remaining = frames
+    while remaining > 0 {
+        let count = AVAudioFrameCount(min(remaining, Int64(format.sampleRate)))
+        guard let buffer = AVAudioPCMBuffer(pcmFormat: format, frameCapacity: count),
+              let channels = buffer.floatChannelData else { throw AudioFailure("Cannot preserve recovery timeline") }
+        buffer.frameLength = count
+        for channel in 0..<Int(format.channelCount) {
+            channels[channel].initialize(repeating: 0, count: Int(count))
+        }
+        try file.write(from: buffer)
+        remaining -= Int64(count)
+    }
+}
 func record() throws {
     let fm = FileManager.default, root = URL(fileURLWithPath: FileManager.default.currentDirectoryPath, isDirectory: true)
     let journal = root.appendingPathComponent("audio_route_recovery.json")
     try recoverRoute(journal)
-    let inventory = try devices(), plan = try capturePlan(inventory), listener = try listeningDevice(inventory)
-    let route = try OutputRoute(plan, listener, journal: journal)
+    let inventory = try devices(), plan = try capturePlan(inventory)
+    var listener = try listeningDevice(inventory)
+    var route = try OutputRoute(plan, listener, journal: journal)
     defer {
         do { try route.restore(); print("NILARIS_ROUTE_RESTORED") }
         catch { print("NILARIS_ROUTE_WARNING: \(error)") }; fflush(stdout)
@@ -366,15 +400,25 @@ func record() throws {
     try writeJSON(metadata, to: metadataURL, exclusive: true)
     var file: AVAudioFile? = try AVAudioFile(forWriting: output, settings: format.settings)
     let state = CaptureState()
-    var tapInstalled = true
+    var tapInstalled = false
+    var outputRecoveries = 0
+    var recoveryEvents: [[String: Any]] = []
     func finishAudio() {
         if tapInstalled { input.removeTap(onBus: 0); tapInstalled = false }
         engine.stop(); file = nil
     }
-    input.installTap(onBus: 0, bufferSize: 1024, format: format) { buffer, _ in
+    func installAudioTap() {
+      input.installTap(onBus: 0, bufferSize: 1024, format: format) { buffer, _ in
         guard buffer.frameLength > 0 else { return }
+        state.lock.lock()
+        state.lastObservedBufferUptime = ProcessInfo.processInfo.systemUptime
+        state.lastObservedChannels = buffer.format.channelCount
+        state.lastObservedRate = buffer.format.sampleRate
+        let paused = state.paused
+        state.lock.unlock()
+        if paused { return }
         guard buffer.format.channelCount == 3, abs(buffer.format.sampleRate - format.sampleRate) < 1,
-              let channels = buffer.floatChannelData else { state.fail("Capture format changed"); return }
+              let channels = buffer.floatChannelData else { state.configurationChanged(); return }
         do {
             try file?.write(from: buffer)
             let count = Int(buffer.frameLength), local = channels[plan.local[0]]
@@ -390,12 +434,16 @@ func record() throws {
                 }
             }
             state.lock.lock(); state.frames += Int64(count); state.lastBuffer = Date()
+            state.lastBufferUptime = ProcessInfo.processInfo.systemUptime
             if energy / Float(count) > 0.000001 {
                 state.localActiveBuffers += 1; if matches.contains(true) { state.duplicatedBuffers += 1 }
             }
             state.lock.unlock()
         } catch { state.fail("Audio write failure: \(error)") }
+      }
+      tapInstalled = true
     }
+    installAudioTap()
     defer { finishAudio() }
     signal(SIGTERM, SIG_IGN); signal(SIGINT, SIG_IGN)
     let term = DispatchSource.makeSignalSource(signal: SIGTERM, queue: .global())
@@ -426,6 +474,131 @@ func record() throws {
             state.lock.unlock()
             if let error { throw AudioFailure(error) }
             if stopped { break }
+            if ready {
+                let available = try devices()
+                try verifySameCapture(plan, capturePlan(available))
+                var listenerLost = !available.contains { $0.uid == listener.uid && $0.outputChannels > 0 }
+                let verifiedInput = (try? verifyInputUnit(unit, selected)) != nil
+                let needsRecovery = generation != handledGeneration || listenerLost || !engine.isRunning || !verifiedInput
+                if needsRecovery {
+                    guard outputRecoveries < 6 else { throw AudioFailure("Repeated audio changes; partial recording preserved") }
+                    outputRecoveries += 1
+                    print("NILARIS_ROUTE_WARNING: Reconnecting audio; a short gap will be marked in the recording")
+                    fflush(stdout)
+                    state.lock.lock(); state.paused = true; state.lock.unlock()
+                    engine.stop()
+                    if tapInstalled { input.removeTap(onBus: 0); tapInstalled = false }
+                    state.lock.lock()
+                    let gapBegan = state.lastBufferUptime, offsetFrames = state.frames
+                    state.lock.unlock()
+                    let deadline = ProcessInfo.processInfo.systemUptime + 10
+                    // Device-alive changes can arrive just after the engine notification.
+                    if !listenerLost {
+                        let settleUntil = ProcessInfo.processInfo.systemUptime + 0.7
+                        while ProcessInfo.processInfo.systemUptime < settleUntil {
+                            if !(try devices()).contains(where: { $0.uid == listener.uid && $0.outputChannels > 0 }) {
+                                listenerLost = true; break
+                            }
+                            Thread.sleep(forTimeInterval: 0.05)
+                        }
+                    }
+                    var event: [String: Any] = ["status": "recovering", "from_listener": listener.json,
+                        "audio_offset_seconds": Double(offsetFrames) / format.sampleRate,
+                        "started_at": ISO8601DateFormatter().string(from: Date()),
+                        "reason": listenerLost ? "listening_device_disconnected" : "audio_engine_configuration_changed"]
+                    recoveryEvents.append(event)
+                    metadata["output_recoveries"] = recoveryEvents
+                    try writeJSON(metadata, to: metadataURL)
+                    if listenerLost {
+                        let destination = try disconnectedListenerFallback(devices())
+                        try route.restore()
+                        route = try OutputRoute(plan, destination, journal: journal)
+                        listener = destination
+                    } else {
+                        let currentOutput: AudioObjectID = try value(systemObject, kAudioHardwarePropertyDefaultOutputDevice, AudioObjectID.self)
+                        guard currentOutput == route.id else {
+                            throw AudioFailure("Output was manually changed; partial recording preserved")
+                        }
+                    }
+                    // An output change can reset AVAudioEngine's input AudioUnit.
+                    // Rebind it to the original, independently verified capture layout.
+                    try checked(AudioUnitSetProperty(unit, kAudioOutputUnitProperty_CurrentDevice,
+                        kAudioUnitScope_Global, 0, &selected, UInt32(MemoryLayout<AudioDeviceID>.size)), "Rebind input after output change")
+                    var restoredClient = captureClientDescription(sampleRate: plan.sampleRate, channels: 3)
+                    try checked(AudioUnitSetProperty(unit, kAudioUnitProperty_StreamFormat,
+                        kAudioUnitScope_Output, 1, &restoredClient, UInt32(MemoryLayout<AudioStreamBasicDescription>.size)),
+                        "Restore capture format after output change")
+                    let restoredMap = identity.withUnsafeBytes {
+                        AudioUnitSetProperty(unit, kAudioOutputUnitProperty_ChannelMap,
+                            kAudioUnitScope_Output, 1, $0.baseAddress!, mapBytes)
+                    }
+                    try checked(restoredMap, "Restore channel mapping after output change")
+                    let restoredFormat = input.outputFormat(forBus: 0)
+                    guard restoredFormat.channelCount == format.channelCount,
+                          abs(restoredFormat.sampleRate - format.sampleRate) < 1 else {
+                        throw AudioFailure("Capture format could not be restored; partial audio preserved")
+                    }
+                    try verifyInputUnit(unit, selected)
+                    installAudioTap()
+                    let restartedAt = ProcessInfo.processInfo.systemUptime
+                    try engine.start()
+                    var stable = false
+                    var stableGeneration = -1
+                    while ProcessInfo.processInfo.systemUptime < deadline {
+                        try verifySameCapture(plan, capturePlan(devices()))
+                        try verifyInputUnit(unit, selected)
+                        state.lock.lock()
+                        let observedAt = state.lastObservedBufferUptime, changedAt = state.lastConfigurationChange,
+                            recoveryError = state.error, stopRequested = state.stopped,
+                            observedGeneration = state.configurationGeneration,
+                            observedChannels = state.lastObservedChannels, observedRate = state.lastObservedRate
+                        state.lock.unlock()
+                        if let recoveryError { throw AudioFailure(recoveryError) }
+                        if stopRequested { break }
+                        if engine.isRunning && observedAt > restartedAt &&
+                            ProcessInfo.processInfo.systemUptime - restartedAt >= 0.5 &&
+                            observedChannels == format.channelCount && abs(observedRate - format.sampleRate) < 1 &&
+                            Date().timeIntervalSince(changedAt) > 0.5 {
+                            stable = true; stableGeneration = observedGeneration; break
+                        }
+                        Thread.sleep(forTimeInterval: 0.05)
+                    }
+                    state.lock.lock(); let stopping = state.stopped; state.lock.unlock()
+                    if stopping { break }
+                    guard stable else { throw AudioFailure("Audio did not resume after output change; partial recording preserved") }
+                    let resumedInventory = try devices()
+                    guard resumedInventory.contains(where: { $0.uid == listener.uid && $0.outputChannels > 0 }),
+                          try value(systemObject, kAudioHardwarePropertyDefaultOutputDevice, AudioObjectID.self) == route.id else {
+                        throw AudioFailure("Playback route changed again during recovery; partial recording preserved")
+                    }
+                    let gapFrames = Int64(((ProcessInfo.processInfo.systemUptime - gapBegan) * format.sampleRate).rounded())
+                    guard let destinationFile = file else { throw AudioFailure("Recording file closed during output recovery") }
+                    try writeRecoverySilence(destinationFile, format, frames: gapFrames)
+                    state.lock.lock()
+                    state.frames += gapFrames
+                    if state.configurationGeneration != stableGeneration {
+                        state.lock.unlock()
+                        throw AudioFailure("Audio changed again before recovery completed; partial recording preserved")
+                    }
+                    state.lastBuffer = Date(); state.lastBufferUptime = ProcessInfo.processInfo.systemUptime
+                    handledGeneration = state.configurationGeneration
+                    state.paused = false
+                    state.lock.unlock()
+                    event["status"] = "resumed"; event["to_listener"] = listener.json
+                    event["gap_frames"] = gapFrames
+                    event["gap_seconds"] = Double(gapFrames) / format.sampleRate
+                    event["gap_content"] = "inserted_silence_no_audio_recovered"
+                    recoveryEvents[recoveryEvents.count - 1] = event
+                    metadata["output_recoveries"] = recoveryEvents
+                    metadata["output"] = ["listener": listener.json, "managed_uid": route.deviceUID,
+                        "previous_uid": route.previousUID]
+                    try writeJSON(metadata, to: metadataURL)
+                    print("NILARIS_OUTPUT: \(listener.name)")
+                    print("NILARIS_ROUTE_WARNING: Audio resumed through \(listener.name); \(String(format: "%.2f", Double(gapFrames) / format.sampleRate))s gap marked as silence")
+                    fflush(stdout)
+                    continue
+                }
+            }
             if !ready && generation != handledGeneration {
                 handledGeneration = generation
                 stableSince = changedAt
@@ -485,15 +658,15 @@ func record() throws {
             if ready && Date().timeIntervalSince(last) > 5 { throw AudioFailure("Audio buffers stopped arriving") }
             if Date().timeIntervalSince(began) > 9 * 3600 { print("NILARIS_AUTO_STOP: Hard limit reached"); break }
             if ready {
-                let current = try capturePlan(devices())
-                guard current.aggregate.uid == plan.aggregate.uid, current.orderedUIDs == plan.orderedUIDs,
-                      current.local == plan.local, current.remote == plan.remote,
-                      abs(current.sampleRate - plan.sampleRate) < 1 else { throw AudioFailure("Input configuration changed") }
-                guard try value(listener.id, kAudioDevicePropertyDeviceIsAlive, UInt32.self) != 0
-                    else { throw AudioFailure("Listening device disconnected") }
-                try verifyInputUnit(unit, selected)
-                let currentOutput: AudioDeviceID = try value(systemObject, kAudioHardwarePropertyDefaultOutputDevice, AudioDeviceID.self)
-                guard currentOutput == route.id else { throw AudioFailure("Output changed; partial audio preserved") }
+                state.lock.lock(); let pendingChange = state.paused; state.lock.unlock()
+                let currentOutput: AudioObjectID = try value(systemObject, kAudioHardwarePropertyDefaultOutputDevice, AudioObjectID.self)
+                // Handle a disappearance on the next iteration instead of racing
+                // the disconnect notification with the ordinary route guard.
+                let remainingOutputs = try devices()
+                if currentOutput != route.id && !pendingChange &&
+                    remainingOutputs.contains(where: { $0.uid == listener.uid && $0.outputChannels > 0 }) {
+                    throw AudioFailure("Output manually changed; partial audio preserved")
+                }
             }
             Thread.sleep(forTimeInterval: 0.5)
         }
@@ -514,6 +687,10 @@ func record() throws {
     } catch {
         finishAudio()
         state.lock.lock(); let frames = state.frames; state.lock.unlock()
+        if !recoveryEvents.isEmpty && (recoveryEvents.last?["status"] as? String) == "recovering" {
+            recoveryEvents[recoveryEvents.count - 1]["status"] = "failed"
+            metadata["output_recoveries"] = recoveryEvents
+        }
         metadata["status"] = "failed"; metadata["captured_frames"] = frames; metadata["error"] = String(describing: error)
         try? writeJSON(metadata, to: metadataURL); throw error
     }
@@ -595,7 +772,62 @@ func selfTest() throws {
     try expect(startupState.configurationGeneration == 1 && startupState.error == nil)
     startupState.ready = true
     startupState.configurationChanged()
-    try expect(startupState.error != nil && startupState.configurationGeneration == 1)
+    try expect(startupState.error == nil && startupState.configurationGeneration == 2 && startupState.paused)
+    // Input-layout changes remain fatal; only the unchanged mapping can resume.
+    let captureDevice = fixture(10, kAudioDeviceTransportTypeAggregate)
+    let blackholeDevice = fixture(11, kAudioDeviceTransportTypeVirtual)
+    let microphoneDevice = fixture(12, kAudioDeviceTransportTypeBuiltIn, 0)
+    let stablePlan = CapturePlan(aggregate: captureDevice, microphone: microphoneDevice,
+        blackhole: blackholeDevice, local: [2], remote: [0, 1], orderedUIDs: ["blackhole", "mic"], sampleRate: 48000)
+    try verifySameCapture(stablePlan, stablePlan)
+    let changedPlan = CapturePlan(aggregate: captureDevice, microphone: microphoneDevice,
+        blackhole: blackholeDevice, local: [0], remote: [1, 2], orderedUIDs: ["mic", "blackhole"], sampleRate: 48000)
+    do {
+        try verifySameCapture(stablePlan, changedPlan)
+        throw AudioFailure("Changed capture layout was accepted")
+    } catch let error as AudioFailure {
+        guard error.description.contains("Input layout changed") else { throw error }
+    }
+    try expect(try disconnectedListenerFallback([speaker, headset]).id == speaker.id)
+    do {
+        _ = try disconnectedListenerFallback([headset])
+        throw AudioFailure("Missing fallback was accepted")
+    } catch let error as AudioFailure {
+        guard error.description.contains("Cannot identify built-in speakers") else { throw error }
+    }
+    let silenceURL = FileManager.default.temporaryDirectory.appendingPathComponent("nilaris-gap-test-\(UUID().uuidString).caf")
+    defer { try? FileManager.default.removeItem(at: silenceURL) }
+    var gapDescription = captureClientDescription(sampleRate: 48000, channels: 3)
+    guard let gapLayout = AVAudioChannelLayout(layoutTag: kAudioChannelLayoutTag_DiscreteInOrder | 3),
+          let silenceFormat = AVAudioFormat(streamDescription: &gapDescription, channelLayout: gapLayout)
+        else { throw AudioFailure("Gap fixture format unavailable") }
+    do {
+        let silenceFile = try AVAudioFile(forWriting: silenceURL, settings: silenceFormat.settings)
+        guard let tone = AVAudioPCMBuffer(pcmFormat: silenceFormat, frameCapacity: 100),
+              let samples = tone.floatChannelData else { throw AudioFailure("Recovery PCM fixture unavailable") }
+        tone.frameLength = 100
+        for channel in 0..<3 { samples[channel].initialize(repeating: 0.25, count: 100) }
+        try silenceFile.write(from: tone)
+        try writeRecoverySilence(silenceFile, silenceFormat, frames: 2400)
+        try silenceFile.write(from: tone)
+        try expect(silenceFile.length == 2600)
+        do {
+            try writeRecoverySilence(silenceFile, silenceFormat, frames: 48000 * 16)
+            throw AudioFailure("Unbounded recovery gap was accepted")
+        } catch let error as AudioFailure {
+            guard error.description.contains("permitted audio gap") else { throw error }
+        }
+    }
+    let silenceRead = try AVAudioFile(forReading: silenceURL)
+    try expect(silenceRead.length == 2600 && silenceRead.processingFormat.channelCount == 3)
+    guard let recovered = AVAudioPCMBuffer(pcmFormat: silenceRead.processingFormat, frameCapacity: 2600)
+        else { throw AudioFailure("Recovery read fixture unavailable") }
+    try silenceRead.read(into: recovered)
+    guard let recoveredChannels = recovered.floatChannelData else { throw AudioFailure("Recovery PCM could not be read") }
+    for channel in 0..<3 {
+        try expect(recoveredChannels[channel][0] == 0.25 && recoveredChannels[channel][2599] == 0.25)
+        for frame in 100..<2500 { try expect(recoveredChannels[channel][frame] == 0) }
+    }
     let clientFixture = captureClientDescription(sampleRate: 48000, channels: 3)
     try expect(clientFixture.mSampleRate == 48000 && clientFixture.mChannelsPerFrame == 3)
     try expect(clientFixture.mBytesPerFrame == 4 && clientFixture.mBitsPerChannel == 32 &&
@@ -638,7 +870,7 @@ func selfTest() throws {
     } catch let error as AudioFailure {
         guard error.description.contains("Multiple Bluetooth") else { throw error }
     }
-    print("NILARIS_SELF_TEST_PASS: startup/format/policy/composition checks including mono Bluetooth; no settings changed")
+    print("NILARIS_SELF_TEST_PASS: startup/format/policy/composition checks including mono Bluetooth and disconnect recovery; no settings changed")
 }
 do {
     if CommandLine.arguments.contains("--self-test") {

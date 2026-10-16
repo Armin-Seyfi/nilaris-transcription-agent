@@ -39,4 +39,18 @@ class RecordingValidationTests(unittest.TestCase):
         self.assertTrue(c.ready_event.is_set())
 
 
+    def test_disconnect_warning_and_new_listener_are_visible_while_recording(self):
+        c=RecordingController();c.process=FakeProcess();c.ready_event.set()
+        class Output:
+            stdout=['NILARIS_OUTPUT: WH-1000XM4\n',
+                    'NILARIS_ROUTE_WARNING: Reconnecting audio; a short gap will be marked\n',
+                    'NILARIS_OUTPUT: MacBook Pro Speakers\n',
+                    'NILARIS_ROUTE_WARNING: Audio resumed through MacBook Pro Speakers; 1.20s gap marked as silence\n']
+        c._read_output(Output())
+        status=c.get_status()
+        self.assertEqual(status['state'],'recording')
+        self.assertEqual(status['listening_device'],'MacBook Pro Speakers')
+        self.assertIn('1.20s gap',status['route_warning'])
+
+
 if __name__=='__main__':unittest.main()

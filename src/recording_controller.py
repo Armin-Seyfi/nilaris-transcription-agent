@@ -240,6 +240,7 @@ class RecordingController:
                 "max_duration_seconds": self.max_duration_seconds,
                 "pid": self.process.pid,
                 "listening_device": self.listening_device,
+                "route_warning": self.route_warning,
                 "error": (
                     "Audio write failure"
                     if state == "error" and any(

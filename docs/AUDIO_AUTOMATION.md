@@ -90,5 +90,33 @@ a Bluetooth profile or activate the headset microphone.
 The regression reproduces a selected mono headset alongside built-in speakers
 and checks that the headset is retained. Actual playback and BlackHole signal
 need a short on-device recording test; policy fixtures alone do not establish
-hardware compatibility. A disconnect during recording still ends capture rather
-than silently changing the input layout.
+hardware compatibility. Headphone disconnection is handled by the bounded recovery process below.
+
+
+### Headphone disconnect during capture
+
+If the selected listening device disappears, the recorder pauses file writes,
+verifies the original input aggregate and channel order, replaces its temporary
+playback route with BlackHole plus built-in speakers, and explicitly rebinds the
+input AudioUnit. Configuration notifications pause writes instead of immediately
+terminating the session. Recording resumes only after mapped input buffers and
+the managed playback route have been checked. Other input layout changes remain
+fatal; original partial audio is preserved.
+
+A short interruption is possible. Missing audio is not reconstructed: the
+recorder inserts bounded silence into the same CAF to preserve approximate
+recording-relative time. Capture metadata records the reason, source and target
+listener, audio offset, gap frame count and duration. The UI exposes recovery and
+resume warnings and the updated listening device. Recovery is limited to six
+attempts per recording, a ten-second restart window per attempt and fifteen
+seconds of inserted silence; failed attempts preserve partial recordings.
+
+Switching back to reconnected headphones or manually selecting another output
+during recording is not an automatic routing feature. Use the intended output
+before starting the next recording. Apps pinned to their own output device may
+not follow a replacement system-default route and need separate validation.
+
+Offline Swift tests check the recovery gate, refusal of changed input mapping,
+speaker fallback, bounded gap insertion, and unchanged samples before and after
+the inserted silence. Hardware behaviour requires a short real disconnect test;
+these tests do not establish uninterrupted capture on every macOS/device pairing.
