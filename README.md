@@ -15,7 +15,7 @@ the transcript text to OpenAI without an additional cost confirmation.
 | Capability | Behavior |
 | --- | --- |
 | Microphone + system capture | Explicit CoreAudio device binding and verified per-recording channel metadata |
-| Speaker/headphone routing | Temporary BlackHole + listening-device output; bounded speaker fallback after headphone disconnect, with marked silence for any recovery gap |
+| Speaker/headphone routing | Temporary BlackHole + listening-device output; experimental speaker fallback on headphone disconnect with independent input-only capture |
 | Chunk preparation | Separate LOCAL/REMOTE streams; five-minute, mono 16 kHz, 64 kbps MP3 chunks |
 | Paid transcription control | Cost estimate and explicit Whisper approval; silent chunks skipped and cached results reused |
 | Timing | Chunk offsets retained; conservative boundary corrections with provenance in JSON |
@@ -44,7 +44,7 @@ flowchart TD
     F --> H[Automatic AI title + manual editing]
 ```
 
-The Swift recorder owns audio binding, format checks and route recovery. Python
+The Swift recorder owns input-only CoreAudio binding, format checks and route recovery. Python
 validates capture metadata, prepares chunks, controls transcription approval and
 serves the archive. Transcript and title generation are separate: a title error
 does not invalidate successful transcription.

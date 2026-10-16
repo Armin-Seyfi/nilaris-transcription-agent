@@ -93,33 +93,41 @@ need a short on-device recording test; policy fixtures alone do not establish
 hardware compatibility. Headphone disconnection is handled by the bounded recovery process below.
 
 
-### Headphone disconnect during capture
+### Input capture independent of playback
 
-If the selected listening device disappears, the recorder pauses file writes,
-verifies the original input aggregate and channel order, replaces its temporary
-playback route with BlackHole plus built-in speakers, and recreates the capture engine, input node and AudioUnit using the same
-explicit binding sequence as a cold start. The previous engine can retain an
-invalid/default-device AUHAL after Bluetooth removal; rebinding that old handle
-alone failed in on-device tests. Recovery stages are saved in the capture sidecar
-to identify any further hardware-specific failure. Configuration notifications pause writes instead of immediately
-terminating the session. Recording resumes only after mapped input buffers and
-the managed playback route have been checked. Other input layout changes remain
-fatal; original partial audio is preserved.
+The capture backend uses an input-only CoreAudio AUHAL instance with input enabled
+on element 1, playback disabled on element 0, and CurrentDevice pinned to the
+verified Nilaris Audio Input aggregate. Its callback calls AudioUnitRender into
+a preallocated, three-channel Float32 buffer and writes the same CAF format as
+before. The local microphone remains the built-in microphone. No global input
+setting is changed.
 
-A short interruption is possible. Missing audio is not reconstructed: the
-recorder inserts bounded silence into the same CAF to preserve approximate
-recording-relative time. Capture metadata records the reason, source and target
-listener, audio offset, gap frame count and duration. The UI exposes recovery and
-resume warnings and the updated listening device. Recovery is limited to six
-attempts per recording, a ten-second restart window per attempt and fifteen
-seconds of inserted silence; failed attempts preserve partial recordings.
+This replaces AVAudioEngine capture. On-device logs showed that both rebinding
+and recreating AVAudioEngine returned the correct capture device before start,
+then reported a different device after engine.start during Bluetooth removal.
+Direct input-only AUHAL avoids that shared input/output engine lifecycle.
 
-Switching back to reconnected headphones or manually selecting another output
-during recording is not an automatic routing feature. Use the intended output
-before starting the next recording. Apps pinned to their own output device may
-not follow a replacement system-default route and need separate validation.
+If the listening device disappears, only the temporary playback route is replaced
+with BlackHole plus built-in speakers. The input unit stays running and must
+retain its device and channel mapping; capture must advance across the playback
+transition before success is reported. Source layout changes, rendering errors
+and stalled buffers fail closed and preserve partial audio. Playback replacement
+is limited to six attempts per recording.
 
-Offline Swift tests check the recovery gate, refusal of changed input mapping,
-speaker fallback, bounded gap insertion, and unchanged samples before and after
-the inserted silence. Hardware behaviour requires a short real disconnect test;
-these tests do not establish uninterrupted capture on every macOS/device pairing.
+A brief remote-audio interruption is possible while apps follow the new default
+output. No missing speech is reconstructed and no artificial silence is inserted:
+the input clock keeps recording the microphone and whatever reaches BlackHole.
+Capture metadata records the transition interval, listener change, continuity
+check, and possible missing remote audio. UI warnings display the transition.
+The sidecar identifies this backend as independent_input_only_auhal_v1.
+
+Reconnecting headphones or manually selecting another output during recording
+is not an automatic return-to-headphones feature. Apps pinned to their own output
+device may not follow the new system route and need separate validation.
+
+Offline tests exercise the actual input-only configuration helper with an injected
+CoreAudio property setter: input is enabled, playback is disabled, the explicit
+capture device is selected, and property failures are rejected. Mapping and
+playback policy tests remain. Real microphone/system capture and headphone
+disconnection need on-device validation; compilation and fixtures do not establish
+hardware compatibility.

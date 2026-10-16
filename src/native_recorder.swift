@@ -264,24 +264,10 @@ func recoverRoute(_ journal: URL) throws {
 final class CaptureState {
     let lock = NSLock()
     var frames: Int64 = 0
-    var lastBuffer = Date(), error: String?, stopped = false, ready = false
+    var error: String?, stopped = false, ready = false
     var localActiveBuffers = 0, duplicatedBuffers = 0
-    var configurationGeneration = 0
-    var paused = false
     var lastBufferUptime = ProcessInfo.processInfo.systemUptime
-    var lastObservedBufferUptime = ProcessInfo.processInfo.systemUptime
-    var lastObservedChannels: AVAudioChannelCount = 0
-    var lastObservedRate: Double = 0
-    var lastConfigurationChange = Date()
     func fail(_ message: String) { lock.lock(); if error == nil { error = message }; lock.unlock() }
-    func configurationChanged() {
-        lock.lock()
-        // Freeze writes until the fixed input layout has been reverified.
-        configurationGeneration += 1
-        lastConfigurationChange = Date()
-        if ready { paused = true }
-        lock.unlock()
-    }
     func stop() { lock.lock(); stopped = true; lock.unlock() }
 }
 func captureClientDescription(sampleRate: Double, channels: UInt32) -> AudioStreamBasicDescription {
@@ -318,25 +304,137 @@ func disconnectedListenerFallback(_ inventory: [Device]) throws -> Device {
     guard speakers.count == 1 else { throw AudioFailure("Cannot identify built-in speakers for output recovery") }
     return speakers[0]
 }
-func writeRecoverySilence(_ file: AVAudioFile, _ format: AVAudioFormat, frames: Int64) throws {
-    guard frames >= 0, frames <= Int64(format.sampleRate * 15) else {
-        throw AudioFailure("Output recovery exceeded the permitted audio gap")
+typealias CapturePropertySetter = (AudioUnit, AudioUnitPropertyID, AudioUnitScope,
+    AudioUnitElement, UnsafeRawPointer, UInt32) -> OSStatus
+func configureIndependentIO(_ unit: AudioUnit, selected: AudioDeviceID,
+    setter: CapturePropertySetter = { AudioUnitSetProperty($0, $1, $2, $3, $4, $5) }) throws {
+    var on: UInt32 = 1, off: UInt32 = 0, device = selected
+    try checked(setter(unit, kAudioOutputUnitProperty_EnableIO, kAudioUnitScope_Input, 1, &on, 4),
+                "Enable capture input")
+    try checked(setter(unit, kAudioOutputUnitProperty_EnableIO, kAudioUnitScope_Output, 0, &off, 4),
+                "Disable capture playback")
+    try checked(setter(unit, kAudioOutputUnitProperty_CurrentDevice, kAudioUnitScope_Global, 0, &device, 4),
+                "Pin independent capture device")
+}
+// Capture is deliberately input-only: playback/default-output changes must not
+// redirect a shared AVAudioEngine input/output AudioUnit.
+let fixedInputCallback: AURenderCallback = { context, flags, timestamp, _, frames, _ in
+    return Unmanaged<FixedInputCapture>.fromOpaque(context).takeUnretainedValue()
+        .receive(flags: flags, timestamp: timestamp, frames: frames)
+}
+final class FixedInputCapture {
+    let plan: CapturePlan, state: CaptureState, format: AVAudioFormat
+    let buffer: AVAudioPCMBuffer
+    var unit: AudioUnit?
+    var writer: AVAudioFile?
+    var started = false
+    var initialized = false
+    init(plan: CapturePlan, state: CaptureState, output: URL) throws {
+        self.plan = plan; self.state = state
+        var description = captureClientDescription(sampleRate: plan.sampleRate, channels: 3)
+        guard let layout = AVAudioChannelLayout(layoutTag: kAudioChannelLayoutTag_DiscreteInOrder | 3),
+              let format = AVAudioFormat(streamDescription: &description, channelLayout: layout),
+              let buffer = AVAudioPCMBuffer(pcmFormat: format, frameCapacity: 16384)
+            else { throw AudioFailure("Cannot allocate fixed-input capture buffers") }
+        self.format = format; self.buffer = buffer
+        var componentDescription = AudioComponentDescription(componentType: kAudioUnitType_Output,
+            componentSubType: kAudioUnitSubType_HALOutput, componentManufacturer: kAudioUnitManufacturer_Apple,
+            componentFlags: 0, componentFlagsMask: 0)
+        guard let component = AudioComponentFindNext(nil, &componentDescription)
+            else { throw AudioFailure("CoreAudio input component unavailable") }
+        var instance: AudioComponentInstance?
+        try checked(AudioComponentInstanceNew(component, &instance), "Create independent capture AudioUnit")
+        guard let instance else { throw AudioFailure("Independent capture AudioUnit missing") }
+        unit = instance
+        do {
+            try configureIndependentIO(instance, selected: plan.aggregate.id)
+            var hardware = AudioStreamBasicDescription(), size = UInt32(MemoryLayout<AudioStreamBasicDescription>.size)
+            try checked(AudioUnitGetProperty(instance, kAudioUnitProperty_StreamFormat,
+                kAudioUnitScope_Input, 1, &hardware, &size), "Read independent capture hardware")
+            guard hardware.mChannelsPerFrame == 3, abs(hardware.mSampleRate - plan.sampleRate) < 1
+                else { throw AudioFailure("Independent capture hardware disagrees with mapping") }
+            try checked(AudioUnitSetProperty(instance, kAudioUnitProperty_StreamFormat,
+                kAudioUnitScope_Output, 1, &description, size), "Set independent capture format")
+            let mapping: [Int32] = [0, 1, 2]
+            let mapStatus = mapping.withUnsafeBytes {
+                AudioUnitSetProperty(instance, kAudioOutputUnitProperty_ChannelMap,
+                    kAudioUnitScope_Output, 1, $0.baseAddress!, UInt32($0.count))
+            }
+            try checked(mapStatus, "Map independent capture channels")
+            var callback = AURenderCallbackStruct(inputProc: fixedInputCallback,
+                inputProcRefCon: Unmanaged.passUnretained(self).toOpaque())
+            try checked(AudioUnitSetProperty(instance, kAudioOutputUnitProperty_SetInputCallback,
+                kAudioUnitScope_Global, 0, &callback, UInt32(MemoryLayout<AURenderCallbackStruct>.size)),
+                "Install independent capture callback")
+            try checked(AudioUnitInitialize(instance), "Initialize independent capture")
+            initialized = true
+            try verifyInputUnit(instance, plan.aggregate.id)
+            writer = try AVAudioFile(forWriting: output, settings: format.settings)
+        } catch { close(); throw error }
     }
-    var remaining = frames
-    while remaining > 0 {
-        let count = AVAudioFrameCount(min(remaining, Int64(format.sampleRate)))
-        guard let buffer = AVAudioPCMBuffer(pcmFormat: format, frameCapacity: count),
-              let channels = buffer.floatChannelData else { throw AudioFailure("Cannot preserve recovery timeline") }
-        buffer.frameLength = count
-        for channel in 0..<Int(format.channelCount) {
-            channels[channel].initialize(repeating: 0, count: Int(count))
+    func start() throws {
+        guard let unit else { throw AudioFailure("Capture unit is closed") }
+        try checked(AudioOutputUnitStart(unit), "Start independent capture")
+        started = true
+        try verifyInputUnit(unit, plan.aggregate.id)
+    }
+    func receive(flags: UnsafeMutablePointer<AudioUnitRenderActionFlags>,
+                 timestamp: UnsafePointer<AudioTimeStamp>, frames: UInt32) -> OSStatus {
+        guard frames > 0 else { return noErr }
+        state.lock.lock(); let failed = state.error != nil; state.lock.unlock()
+        if failed { return noErr }
+        guard let unit, frames <= buffer.frameCapacity else {
+            state.fail("Independent input callback exceeded buffer capacity"); return noErr
         }
-        try file.write(from: buffer)
-        remaining -= Int64(count)
+        buffer.frameLength = frames
+        let result = AudioUnitRender(unit, flags, timestamp, 1, frames, buffer.mutableAudioBufferList)
+        guard result == noErr else {
+            state.fail("Independent input render failed: CoreAudio error \(result)"); return noErr
+        }
+        guard let samples = buffer.floatChannelData else {
+            state.fail("Independent input PCM channels unavailable"); return noErr
+        }
+        var energy: Float = 0, matches = [Bool](repeating: true, count: plan.remote.count)
+        for frame in 0..<Int(frames) {
+            let local = samples[plan.local[0]][frame]
+            guard local.isFinite else { state.fail("Non-finite local capture sample"); return noErr }
+            energy += local * local
+            for (index, channel) in plan.remote.enumerated() {
+                let remote = samples[channel][frame]
+                guard remote.isFinite else { state.fail("Non-finite remote capture sample"); return noErr }
+                if local.bitPattern != remote.bitPattern { matches[index] = false }
+            }
+        }
+        do {
+            guard let writer else { throw AudioFailure("Capture file closed unexpectedly") }
+            try writer.write(from: buffer)
+            state.lock.lock()
+            state.frames += Int64(frames)
+            state.lastBufferUptime = ProcessInfo.processInfo.systemUptime
+            if energy / Float(frames) > 0.000001 {
+                state.localActiveBuffers += 1
+                if matches.contains(true) { state.duplicatedBuffers += 1 }
+            }
+            state.lock.unlock()
+        } catch { state.fail("Audio write failure: \(error)") }
+        return noErr
     }
+    func verify() throws {
+        guard let unit else { throw AudioFailure("Capture unit closed unexpectedly") }
+        try verifyInputUnit(unit, plan.aggregate.id)
+    }
+    func close() {
+        if let unit {
+            if started { AudioOutputUnitStop(unit); started = false }
+            if initialized { AudioUnitUninitialize(unit); initialized = false }
+            AudioComponentInstanceDispose(unit); self.unit = nil
+        }
+        writer = nil
+    }
+    deinit { close() }
 }
 func record() throws {
-    let fm = FileManager.default, root = URL(fileURLWithPath: FileManager.default.currentDirectoryPath, isDirectory: true)
+    let fm = FileManager.default, root = URL(fileURLWithPath: fm.currentDirectoryPath, isDirectory: true)
     let journal = root.appendingPathComponent("audio_route_recovery.json")
     try recoverRoute(journal)
     let inventory = try devices(), plan = try capturePlan(inventory)
@@ -346,49 +444,6 @@ func record() throws {
         do { try route.restore(); print("NILARIS_ROUTE_RESTORED") }
         catch { print("NILARIS_ROUTE_WARNING: \(error)") }; fflush(stdout)
     }
-    var engine = AVAudioEngine()
-    var input = engine.inputNode
-    guard let initialUnit = input.audioUnit else { throw AudioFailure("Input AudioUnit unavailable") }
-    var unit = initialUnit
-    var selected = plan.aggregate.id
-    try checked(AudioUnitSetProperty(unit, kAudioOutputUnitProperty_CurrentDevice, kAudioUnitScope_Global, 0,
-        &selected, UInt32(MemoryLayout<AudioDeviceID>.size)), "Bind recorder input")
-    var bound: AudioDeviceID = 0, deviceSize = UInt32(MemoryLayout<AudioDeviceID>.size)
-    try checked(AudioUnitGetProperty(unit, kAudioOutputUnitProperty_CurrentDevice, kAudioUnitScope_Global, 0,
-        &bound, &deviceSize), "Verify recorder input")
-    guard bound == selected else { throw AudioFailure("Unexpected recorder device") }
-    // AVAudioEngine may retain the former default-device client format after a
-    // Bluetooth route change. Configure AUHAL's capture-side client format from
-    // the selected device, without changing the device's hardware sample rate.
-    var hardware = AudioStreamBasicDescription()
-    var hardwareSize = UInt32(MemoryLayout<AudioStreamBasicDescription>.size)
-    try checked(AudioUnitGetProperty(unit, kAudioUnitProperty_StreamFormat,
-        kAudioUnitScope_Input, 1, &hardware, &hardwareSize), "Read selected input hardware format")
-    let before = input.outputFormat(forBus: 0)
-    print("NILARIS_INPUT_FORMAT: hardware=\(hardware.mSampleRate)Hz/\(hardware.mChannelsPerFrame)ch, client=\(before.sampleRate)Hz/\(before.channelCount)ch")
-    fflush(stdout)
-    guard hardware.mChannelsPerFrame == 3, abs(hardware.mSampleRate - plan.sampleRate) < 1
-        else { throw AudioFailure("Selected input hardware disagrees with aggregate metadata: hardware=\(hardware.mSampleRate)Hz/\(hardware.mChannelsPerFrame)ch, aggregate=\(plan.sampleRate)Hz/3ch") }
-    var client = captureClientDescription(sampleRate: hardware.mSampleRate, channels: 3)
-    try checked(AudioUnitSetProperty(unit, kAudioUnitProperty_StreamFormat,
-        kAudioUnitScope_Output, 1, &client,
-        UInt32(MemoryLayout<AudioStreamBasicDescription>.size)), "Configure selected input client format")
-    let format = input.outputFormat(forBus: 0)
-    guard format.channelCount == 3, format.commonFormat == .pcmFormatFloat32, !format.isInterleaved,
-          abs(format.sampleRate - plan.sampleRate) < 1 else {
-        throw AudioFailure("Input client format was not applied: observed=\(format.sampleRate)Hz/\(format.channelCount)ch, expected=\(plan.sampleRate)Hz/3ch")
-    }
-    let identity: [Int32] = [0, 1, 2], mapBytes = UInt32(3 * MemoryLayout<Int32>.size)
-    let status = identity.withUnsafeBytes {
-        AudioUnitSetProperty(unit, kAudioOutputUnitProperty_ChannelMap, kAudioUnitScope_Output, 1, $0.baseAddress!, mapBytes)
-    }
-    try checked(status, "Set explicit channel map")
-    var actualMap = [Int32](repeating: -1, count: 3), mapSize = mapBytes
-    let readStatus = actualMap.withUnsafeMutableBytes {
-        AudioUnitGetProperty(unit, kAudioOutputUnitProperty_ChannelMap, kAudioUnitScope_Output, 1, $0.baseAddress!, &mapSize)
-    }
-    try checked(readStatus, "Verify channel map")
-    guard actualMap == identity, mapSize == mapBytes else { throw AudioFailure("Channel map verification failed") }
     let stamp = ISO8601DateFormatter().string(from: Date()).replacingOccurrences(of: ":", with: "-")
     let output = root.appendingPathComponent("recordings/nilaris_\(stamp).caf")
     let metadataURL = output.deletingPathExtension().appendingPathExtension("capture.json")
@@ -397,317 +452,122 @@ func record() throws {
     var metadata = plan.json
     metadata.merge(["schema_version": 1, "recording_file": output.lastPathComponent,
         "started_at": ISO8601DateFormatter().string(from: Date()), "status": "starting",
-        "input_unit_channel_map": identity, "output": ["listener": listener.json,
-        "managed_uid": route.deviceUID, "previous_uid": route.previousUID]]) { _, new in new }
+        "input_unit_channel_map": [0, 1, 2], "capture_backend": "independent_input_only_auhal_v1",
+        "output": ["listener": listener.json, "managed_uid": route.deviceUID,
+                   "previous_uid": route.previousUID]]) { _, new in new }
     try writeJSON(metadata, to: metadataURL, exclusive: true)
-    var file: AVAudioFile? = try AVAudioFile(forWriting: output, settings: format.settings)
     let state = CaptureState()
-    var tapInstalled = false
-    var outputRecoveries = 0
-    var recoveryEvents: [[String: Any]] = []
-    func finishAudio() {
-        if tapInstalled { input.removeTap(onBus: 0); tapInstalled = false }
-        engine.stop(); file = nil
-    }
-    func installAudioTap() {
-      input.installTap(onBus: 0, bufferSize: 1024, format: format) { buffer, _ in
-        guard buffer.frameLength > 0 else { return }
-        state.lock.lock()
-        state.lastObservedBufferUptime = ProcessInfo.processInfo.systemUptime
-        state.lastObservedChannels = buffer.format.channelCount
-        state.lastObservedRate = buffer.format.sampleRate
-        let paused = state.paused
-        state.lock.unlock()
-        if paused { return }
-        guard buffer.format.channelCount == 3, abs(buffer.format.sampleRate - format.sampleRate) < 1,
-              let channels = buffer.floatChannelData else { state.configurationChanged(); return }
-        do {
-            try file?.write(from: buffer)
-            let count = Int(buffer.frameLength), local = channels[plan.local[0]]
-            var energy: Float = 0, matches = [Bool](repeating: true, count: plan.remote.count)
-            for frame in 0..<count {
-                let v = local[frame]
-                guard v.isFinite else { state.fail("Non-finite audio sample"); return }
-                energy += v * v
-                for (index, channel) in plan.remote.enumerated() {
-                    let r = channels[channel][frame]
-                    guard r.isFinite else { state.fail("Non-finite audio sample"); return }
-                    if v.bitPattern != r.bitPattern { matches[index] = false }
-                }
-            }
-            state.lock.lock(); state.frames += Int64(count); state.lastBuffer = Date()
-            state.lastBufferUptime = ProcessInfo.processInfo.systemUptime
-            if energy / Float(count) > 0.000001 {
-                state.localActiveBuffers += 1; if matches.contains(true) { state.duplicatedBuffers += 1 }
-            }
-            state.lock.unlock()
-        } catch { state.fail("Audio write failure: \(error)") }
-      }
-      tapInstalled = true
-    }
-    installAudioTap()
-    defer { finishAudio() }
+    var capture: FixedInputCapture?
+    var events: [[String: Any]] = []
+    defer { capture?.close() }
     signal(SIGTERM, SIG_IGN); signal(SIGINT, SIG_IGN)
     let term = DispatchSource.makeSignalSource(signal: SIGTERM, queue: .global())
     let interrupt = DispatchSource.makeSignalSource(signal: SIGINT, queue: .global())
-    term.setEventHandler { state.stop() }; interrupt.setEventHandler { state.stop() }; term.resume(); interrupt.resume()
+    term.setEventHandler { state.stop() }; interrupt.setEventHandler { state.stop() }
+    term.resume(); interrupt.resume()
     defer { term.cancel(); interrupt.cancel() }
     DispatchQueue.global().async {
         while let command = readLine() {
             if command.trimmingCharacters(in: .whitespacesAndNewlines).uppercased() == "STOP" { state.stop(); return }
         }
-        state.stop() // Parent exited: preserve audio and restore output.
+        state.stop()
     }
-    var observer: NSObjectProtocol? = NotificationCenter.default.addObserver(forName: .AVAudioEngineConfigurationChange,
-        object: engine, queue: nil) { _ in state.configurationChanged() }
-    defer { if let observer { NotificationCenter.default.removeObserver(observer) } }
     do {
-        try engine.start()
-        try verifyInputUnit(unit, selected)
-        let began = Date()
-        var stableSince = began
-        var handledGeneration = 0
-        var startupRestarts = 0
+        capture = try FixedInputCapture(plan: plan, state: state, output: output)
+        try capture!.start()
+        let began = ProcessInfo.processInfo.systemUptime
         while true {
             state.lock.lock()
             let frames = state.frames, error = state.error, stopped = state.stopped,
-                last = state.lastBuffer, ready = state.ready,
-                generation = state.configurationGeneration, changedAt = state.lastConfigurationChange
+                last = state.lastBufferUptime, ready = state.ready
             state.lock.unlock()
             if let error { throw AudioFailure(error) }
             if stopped { break }
-            if ready {
-                let available = try devices()
-                try verifySameCapture(plan, capturePlan(available))
-                var listenerLost = !available.contains { $0.uid == listener.uid && $0.outputChannels > 0 }
-                let verifiedInput = (try? verifyInputUnit(unit, selected)) != nil
-                let needsRecovery = generation != handledGeneration || listenerLost || !engine.isRunning || !verifiedInput
-                if needsRecovery {
-                    guard outputRecoveries < 6 else { throw AudioFailure("Repeated audio changes; partial recording preserved") }
-                    outputRecoveries += 1
-                    print("NILARIS_ROUTE_WARNING: Reconnecting audio; a short gap will be marked in the recording")
-                    fflush(stdout)
-                    state.lock.lock(); state.paused = true; state.lock.unlock()
-                    engine.stop()
-                    if tapInstalled { input.removeTap(onBus: 0); tapInstalled = false }
+            let available = try devices()
+            try verifySameCapture(plan, capturePlan(available))
+            try capture!.verify()
+            if !ready && frames > 0 && ProcessInfo.processInfo.systemUptime - began >= 1 &&
+                ProcessInfo.processInfo.systemUptime - last < 1 {
+                state.lock.lock(); state.ready = true; state.lock.unlock()
+                metadata["status"] = "recording"; metadata["startup_preroll_frames"] = frames
+                try writeJSON(metadata, to: metadataURL)
+                print("NILARIS_OUTPUT: \(listener.name)"); print("NILARIS_READY"); fflush(stdout)
+            }
+            if !ready && ProcessInfo.processInfo.systemUptime - began > 10 {
+                throw AudioFailure("Independent capture did not receive startup audio")
+            }
+            if ready && ProcessInfo.processInfo.systemUptime - last > 5 {
+                throw AudioFailure("Independent capture buffers stopped arriving; partial audio preserved")
+            }
+            if ProcessInfo.processInfo.systemUptime - began > 9 * 3600 {
+                print("NILARIS_AUTO_STOP: Hard limit reached"); break
+            }
+            if !available.contains(where: { $0.uid == listener.uid && $0.outputChannels > 0 }) {
+                guard events.count < 6 else { throw AudioFailure("Repeated playback changes; partial recording preserved") }
+                state.lock.lock(); let fromFrame = state.frames; state.lock.unlock()
+                var event: [String: Any] = ["status": "recovering", "stage": "replace_playback_route",
+                    "reason": "listening_device_disconnected", "from_listener": listener.json,
+                    "audio_offset_seconds": Double(fromFrame) / plan.sampleRate,
+                    "started_at": ISO8601DateFormatter().string(from: Date()), "silence_inserted": false]
+                events.append(event); metadata["output_recoveries"] = events
+                try writeJSON(metadata, to: metadataURL)
+                print("NILARIS_ROUTE_WARNING: Headphones disconnected; switching playback to speakers")
+                fflush(stdout)
+                // The input-only unit stays on the capture aggregate while playback
+                // changes. Any silence at BlackHole is captured on the original clock.
+                let destination = try disconnectedListenerFallback(devices())
+                try route.restore()
+                route = try OutputRoute(plan, destination, journal: journal)
+                listener = destination
+                try verifySameCapture(plan, capturePlan(devices()))
+                try capture!.verify()
+                let continuityDeadline = ProcessInfo.processInfo.systemUptime + 1
+                var throughFrame: Int64 = fromFrame
+                repeat {
                     state.lock.lock()
-                    let gapBegan = state.lastBufferUptime, offsetFrames = state.frames
+                    throughFrame = state.frames
+                    let captureError = state.error
                     state.lock.unlock()
-                    let deadline = ProcessInfo.processInfo.systemUptime + 10
-                    // Device-alive changes can arrive just after the engine notification.
-                    if !listenerLost {
-                        let settleUntil = ProcessInfo.processInfo.systemUptime + 0.7
-                        while ProcessInfo.processInfo.systemUptime < settleUntil {
-                            if !(try devices()).contains(where: { $0.uid == listener.uid && $0.outputChannels > 0 }) {
-                                listenerLost = true; break
-                            }
-                            Thread.sleep(forTimeInterval: 0.05)
-                        }
-                    }
-                    var event: [String: Any] = ["status": "recovering", "from_listener": listener.json,
-                        "audio_offset_seconds": Double(offsetFrames) / format.sampleRate,
-                        "started_at": ISO8601DateFormatter().string(from: Date()),
-                        "reason": listenerLost ? "listening_device_disconnected" : "audio_engine_configuration_changed"]
-                    recoveryEvents.append(event)
-                    func markRecoveryStage(_ stage: String) throws {
-                        event["stage"] = stage
-                        recoveryEvents[recoveryEvents.count - 1] = event
-                        metadata["output_recoveries"] = recoveryEvents
-                        try writeJSON(metadata, to: metadataURL)
-                        print("NILARIS_RECOVERY_STAGE: \(stage)"); fflush(stdout)
-                    }
-                    try markRecoveryStage("replace_playback_route")
-                    if listenerLost {
-                        let destination = try disconnectedListenerFallback(devices())
-                        try route.restore()
-                        route = try OutputRoute(plan, destination, journal: journal)
-                        listener = destination
-                    } else {
-                        let currentOutput: AudioObjectID = try value(systemObject, kAudioHardwarePropertyDefaultOutputDevice, AudioObjectID.self)
-                        guard currentOutput == route.id else {
-                            throw AudioFailure("Output was manually changed; partial recording preserved")
-                        }
-                    }
-                    // A disconnected Bluetooth device can invalidate the old engine's
-                    // cached AUHAL. Do not keep rebinding that old AudioUnit: build a
-                    // fresh graph using the same binding sequence as a cold start.
-                    try markRecoveryStage("create_fresh_capture_engine")
-                    if let oldObserver = observer {
-                        NotificationCenter.default.removeObserver(oldObserver); observer = nil
-                    }
-                    engine = AVAudioEngine()
-                    input = engine.inputNode
-                    guard let replacementUnit = input.audioUnit else {
-                        throw AudioFailure("Replacement input AudioUnit unavailable")
-                    }
-                    unit = replacementUnit
-                    try verifySameCapture(plan, capturePlan(devices()))
-                    try markRecoveryStage("bind_fresh_capture_input")
-                    try checked(AudioUnitSetProperty(unit, kAudioOutputUnitProperty_CurrentDevice,
-                        kAudioUnitScope_Global, 0, &selected, UInt32(MemoryLayout<AudioDeviceID>.size)), "Rebind input after output change")
-                    var restoredHardware = AudioStreamBasicDescription()
-                    var restoredHardwareSize = UInt32(MemoryLayout<AudioStreamBasicDescription>.size)
-                    try checked(AudioUnitGetProperty(unit, kAudioUnitProperty_StreamFormat,
-                        kAudioUnitScope_Input, 1, &restoredHardware, &restoredHardwareSize),
-                        "Read replacement input hardware format")
-                    guard restoredHardware.mChannelsPerFrame == 3,
-                          abs(restoredHardware.mSampleRate - plan.sampleRate) < 1 else {
-                        throw AudioFailure("Replacement hardware format disagrees with fixed capture mapping")
-                    }
-                    var restoredClient = captureClientDescription(sampleRate: plan.sampleRate, channels: 3)
-                    try checked(AudioUnitSetProperty(unit, kAudioUnitProperty_StreamFormat,
-                        kAudioUnitScope_Output, 1, &restoredClient, UInt32(MemoryLayout<AudioStreamBasicDescription>.size)),
-                        "Restore capture format after output change")
-                    let restoredMap = identity.withUnsafeBytes {
-                        AudioUnitSetProperty(unit, kAudioOutputUnitProperty_ChannelMap,
-                            kAudioUnitScope_Output, 1, $0.baseAddress!, mapBytes)
-                    }
-                    try checked(restoredMap, "Restore channel mapping after output change")
-                    let restoredFormat = input.outputFormat(forBus: 0)
-                    guard restoredFormat.channelCount == format.channelCount,
-                          restoredFormat.commonFormat == .pcmFormatFloat32, !restoredFormat.isInterleaved,
-                          abs(restoredFormat.sampleRate - format.sampleRate) < 1 else {
-                        throw AudioFailure("Capture format could not be restored; partial audio preserved")
-                    }
-                    try verifyInputUnit(unit, selected)
-                    try markRecoveryStage("start_fresh_capture_engine")
-                    installAudioTap()
-                    observer = NotificationCenter.default.addObserver(forName: .AVAudioEngineConfigurationChange,
-                        object: engine, queue: nil) { _ in state.configurationChanged() }
-                    let restartedAt = ProcessInfo.processInfo.systemUptime
-                    try engine.start()
-                    try markRecoveryStage("verify_fresh_input_and_buffers")
-                    var stable = false
-                    var stableGeneration = -1
-                    while ProcessInfo.processInfo.systemUptime < deadline {
-                        try verifySameCapture(plan, capturePlan(devices()))
-                        try verifyInputUnit(unit, selected)
-                        state.lock.lock()
-                        let observedAt = state.lastObservedBufferUptime, changedAt = state.lastConfigurationChange,
-                            recoveryError = state.error, stopRequested = state.stopped,
-                            observedGeneration = state.configurationGeneration,
-                            observedChannels = state.lastObservedChannels, observedRate = state.lastObservedRate
-                        state.lock.unlock()
-                        if let recoveryError { throw AudioFailure(recoveryError) }
-                        if stopRequested { break }
-                        if engine.isRunning && observedAt > restartedAt &&
-                            ProcessInfo.processInfo.systemUptime - restartedAt >= 0.5 &&
-                            observedChannels == format.channelCount && abs(observedRate - format.sampleRate) < 1 &&
-                            Date().timeIntervalSince(changedAt) > 0.5 {
-                            stable = true; stableGeneration = observedGeneration; break
-                        }
+                    if let captureError { throw AudioFailure(captureError) }
+                    if throughFrame > fromFrame { break }
+                    Thread.sleep(forTimeInterval: 0.02)
+                } while ProcessInfo.processInfo.systemUptime < continuityDeadline
+                try capture!.verify()
+                guard throughFrame > fromFrame else {
+                    throw AudioFailure("Capture did not advance during playback recovery")
+                }
+                event["status"] = "resumed"; event["stage"] = "complete"
+                event["to_listener"] = listener.json
+                event["capture_continued"] = true
+                event["transition_end_seconds"] = Double(throughFrame) / plan.sampleRate
+                event["transition_seconds"] = Double(throughFrame - fromFrame) / plan.sampleRate
+                event["remote_audio_may_be_missing_during_transition"] = true
+                events[events.count - 1] = event; metadata["output_recoveries"] = events
+                metadata["output"] = ["listener": listener.json, "managed_uid": route.deviceUID,
+                    "previous_uid": route.previousUID]
+                try writeJSON(metadata, to: metadataURL)
+                print("NILARIS_OUTPUT: \(listener.name)")
+                print("NILARIS_ROUTE_WARNING: Capture continued; now listening through \(listener.name). Brief remote-audio interruption is possible.")
+                fflush(stdout)
+            } else {
+                let current: AudioObjectID = try value(systemObject, kAudioHardwarePropertyDefaultOutputDevice, AudioObjectID.self)
+                if current != route.id {
+                    // Default-output and device-alive notifications need not arrive
+                    // together. Keep capturing while waiting briefly for removal.
+                    let settleUntil = ProcessInfo.processInfo.systemUptime + 0.8
+                    var stillPresent = true
+                    repeat {
+                        stillPresent = (try devices()).contains { $0.uid == listener.uid && $0.outputChannels > 0 }
+                        if !stillPresent { break }
                         Thread.sleep(forTimeInterval: 0.05)
-                    }
-                    state.lock.lock(); let stopping = state.stopped; state.lock.unlock()
-                    if stopping { break }
-                    guard stable else { throw AudioFailure("Audio did not resume after output change; partial recording preserved") }
-                    let resumedInventory = try devices()
-                    guard resumedInventory.contains(where: { $0.uid == listener.uid && $0.outputChannels > 0 }),
-                          try value(systemObject, kAudioHardwarePropertyDefaultOutputDevice, AudioObjectID.self) == route.id else {
-                        throw AudioFailure("Playback route changed again during recovery; partial recording preserved")
-                    }
-                    let gapFrames = Int64(((ProcessInfo.processInfo.systemUptime - gapBegan) * format.sampleRate).rounded())
-                    guard let destinationFile = file else { throw AudioFailure("Recording file closed during output recovery") }
-                    try writeRecoverySilence(destinationFile, format, frames: gapFrames)
-                    state.lock.lock()
-                    state.frames += gapFrames
-                    if state.configurationGeneration != stableGeneration {
-                        state.lock.unlock()
-                        throw AudioFailure("Audio changed again before recovery completed; partial recording preserved")
-                    }
-                    state.lastBuffer = Date(); state.lastBufferUptime = ProcessInfo.processInfo.systemUptime
-                    handledGeneration = state.configurationGeneration
-                    state.paused = false
-                    state.lock.unlock()
-                    event["status"] = "resumed"; event["stage"] = "complete"
-                    event["capture_engine_recreated"] = true
-                    event["to_listener"] = listener.json
-                    event["gap_frames"] = gapFrames
-                    event["gap_seconds"] = Double(gapFrames) / format.sampleRate
-                    event["gap_content"] = "inserted_silence_no_audio_recovered"
-                    recoveryEvents[recoveryEvents.count - 1] = event
-                    metadata["output_recoveries"] = recoveryEvents
-                    metadata["output"] = ["listener": listener.json, "managed_uid": route.deviceUID,
-                        "previous_uid": route.previousUID]
-                    try writeJSON(metadata, to: metadataURL)
-                    print("NILARIS_OUTPUT: \(listener.name)")
-                    print("NILARIS_ROUTE_WARNING: Audio resumed through \(listener.name); \(String(format: "%.2f", Double(gapFrames) / format.sampleRate))s gap marked as silence")
-                    fflush(stdout)
-                    continue
-                }
-            }
-            if !ready && generation != handledGeneration {
-                handledGeneration = generation
-                stableSince = changedAt
-                let current = try capturePlan(devices())
-                guard current.aggregate.uid == plan.aggregate.uid, current.orderedUIDs == plan.orderedUIDs,
-                      current.local == plan.local, current.remote == plan.remote,
-                      abs(current.sampleRate - plan.sampleRate) < 1
-                    else { throw AudioFailure("Input changed during startup") }
-                let currentOutput: AudioDeviceID = try value(systemObject, kAudioHardwarePropertyDefaultOutputDevice, AudioDeviceID.self)
-                guard currentOutput == route.id,
-                      try value(listener.id, kAudioDevicePropertyDeviceIsAlive, UInt32.self) != 0
-                    else { throw AudioFailure("Output changed during startup") }
-                let observed = input.outputFormat(forBus: 0)
-                if !engine.isRunning || observed.channelCount != format.channelCount ||
-                    abs(observed.sampleRate - format.sampleRate) >= 1 {
-                    guard startupRestarts < 2 else { throw AudioFailure("Audio engine could not stabilize during startup") }
-                    startupRestarts += 1
-                    engine.stop()
-                    try checked(AudioUnitSetProperty(unit, kAudioOutputUnitProperty_CurrentDevice,
-                        kAudioUnitScope_Global, 0, &selected, UInt32(MemoryLayout<AudioDeviceID>.size)),
-                        "Rebind input during startup")
-                    var client = captureClientDescription(sampleRate: plan.sampleRate, channels: 3)
-                    try checked(AudioUnitSetProperty(unit, kAudioUnitProperty_StreamFormat,
-                        kAudioUnitScope_Output, 1, &client, UInt32(MemoryLayout<AudioStreamBasicDescription>.size)),
-                        "Restore input client format during startup")
-                    let mappingStatus = identity.withUnsafeBytes {
-                        AudioUnitSetProperty(unit, kAudioOutputUnitProperty_ChannelMap,
-                            kAudioUnitScope_Output, 1, $0.baseAddress!, mapBytes)
-                    }
-                    try checked(mappingStatus, "Restore input channel map during startup")
-                    try engine.start()
-                    stableSince = Date()
-                    print("NILARIS_STARTUP_RESTART: \(startupRestarts)"); fflush(stdout)
-                }
-                try verifyInputUnit(unit, selected)
-            }
-            // Wait for a stable startup interval; queued notifications from our own
-            // initial format setup must not be mistaken for mid-recording hotplug.
-            if !ready && frames > 0 && Date().timeIntervalSince(stableSince) >= 1 &&
-                Date().timeIntervalSince(last) < 1 && engine.isRunning {
-                try verifyInputUnit(unit, selected)
-                state.lock.lock()
-                let unchanged = state.configurationGeneration == generation && state.error == nil
-                if unchanged { state.ready = true }
-                state.lock.unlock()
-                if unchanged {
-                    metadata["status"] = "recording"
-                    metadata["startup_preroll_frames"] = frames
-                    metadata["startup_configuration_changes"] = generation
-                    metadata["startup_restarts"] = startupRestarts
-                    try writeJSON(metadata, to: metadataURL)
-                    print("NILARIS_OUTPUT: \(listener.name)")
-                    print("NILARIS_READY"); fflush(stdout)
-                }
-            }
-            if !ready && Date().timeIntervalSince(began) > 10 { throw AudioFailure("No stable audio buffers received during startup") }
-            if ready && Date().timeIntervalSince(last) > 5 { throw AudioFailure("Audio buffers stopped arriving") }
-            if Date().timeIntervalSince(began) > 9 * 3600 { print("NILARIS_AUTO_STOP: Hard limit reached"); break }
-            if ready {
-                state.lock.lock(); let pendingChange = state.paused; state.lock.unlock()
-                let currentOutput: AudioObjectID = try value(systemObject, kAudioHardwarePropertyDefaultOutputDevice, AudioObjectID.self)
-                // Handle a disappearance on the next iteration instead of racing
-                // the disconnect notification with the ordinary route guard.
-                let remainingOutputs = try devices()
-                if currentOutput != route.id && !pendingChange &&
-                    remainingOutputs.contains(where: { $0.uid == listener.uid && $0.outputChannels > 0 }) {
+                    } while ProcessInfo.processInfo.systemUptime < settleUntil
+                    if !stillPresent { continue }
                     throw AudioFailure("Output manually changed; partial audio preserved")
                 }
             }
-            Thread.sleep(forTimeInterval: 0.5)
+            Thread.sleep(forTimeInterval: 0.25)
         }
-        finishAudio()
+        capture?.close()
         state.lock.lock()
         let frames = state.frames, active = state.localActiveBuffers, duplicated = state.duplicatedBuffers,
             callbackError = state.error
@@ -716,26 +576,25 @@ func record() throws {
         guard frames > 0 else { throw AudioFailure("No audio frames recorded") }
         guard active < 10 || Double(duplicated) / Double(active) < 0.95
             else { throw AudioFailure("Identical LOCAL/REMOTE samples; check mapping") }
-        metadata["captured_frames"] = frames; metadata["duration_seconds"] = Double(frames) / format.sampleRate
+        metadata["captured_frames"] = frames; metadata["duration_seconds"] = Double(frames) / plan.sampleRate
         metadata["status"] = "completed"; metadata["finished_at"] = ISO8601DateFormatter().string(from: Date())
         metadata["duplication_check"] = ["local_active_buffers": active, "identical_buffers": duplicated]
         try writeJSON(metadata, to: metadataURL)
         print("NILARIS_SAVED: \(output.path)"); fflush(stdout)
     } catch {
-        finishAudio()
+        capture?.close()
         state.lock.lock(); let frames = state.frames; state.lock.unlock()
-        if !recoveryEvents.isEmpty && (recoveryEvents.last?["status"] as? String) == "recovering" {
-            recoveryEvents[recoveryEvents.count - 1]["status"] = "failed"
-            metadata["output_recoveries"] = recoveryEvents
+        if !events.isEmpty && (events.last?["status"] as? String) == "recovering" {
+            events[events.count - 1]["status"] = "failed"; metadata["output_recoveries"] = events
         }
-        metadata["status"] = "failed"; metadata["captured_frames"] = frames
-        let stage = recoveryEvents.last?["stage"] as? String
+        let stage = events.last?["stage"] as? String
         let detail = String(describing: error) + (stage.map { " [recovery stage: \($0)]" } ?? "")
-        metadata["error"] = detail
+        metadata["status"] = "failed"; metadata["captured_frames"] = frames; metadata["error"] = detail
         try? writeJSON(metadata, to: metadataURL)
         throw AudioFailure(detail)
     }
 }
+
 func outputSnapshot(_ device: Device) -> [String: Any] {
     var result = device.json
     result["output_channels"] = (try? channelCount(device.id, kAudioObjectPropertyScopeOutput)) ?? -1
@@ -808,12 +667,26 @@ func selfTest() throws {
     func expect(_ condition: Bool) throws {
         if !condition { throw AudioFailure("Output policy self-test failed") }
     }
-    let startupState = CaptureState()
-    startupState.configurationChanged()
-    try expect(startupState.configurationGeneration == 1 && startupState.error == nil)
-    startupState.ready = true
-    startupState.configurationChanged()
-    try expect(startupState.error == nil && startupState.configurationGeneration == 2 && startupState.paused)
+    // Exercise the real I/O configuration helper using an injected property
+    // writer: output must be disabled and the explicit aggregate must be pinned.
+    var ioSettings: [(AudioUnitPropertyID, AudioUnitScope, AudioUnitElement, UInt32)] = []
+    let fakeUnit = AudioUnit(bitPattern: 1)!
+    try configureIndependentIO(fakeUnit, selected: 55, setter: { _, property, scope, element, bytes, _ in
+        ioSettings.append((property, scope, element, bytes.load(as: UInt32.self)))
+        return noErr
+    })
+    try expect(ioSettings.count == 3)
+    try expect(ioSettings[0].0 == kAudioOutputUnitProperty_EnableIO &&
+        ioSettings[0].1 == kAudioUnitScope_Input && ioSettings[0].2 == 1 && ioSettings[0].3 == 1)
+    try expect(ioSettings[1].0 == kAudioOutputUnitProperty_EnableIO &&
+        ioSettings[1].1 == kAudioUnitScope_Output && ioSettings[1].2 == 0 && ioSettings[1].3 == 0)
+    try expect(ioSettings[2].0 == kAudioOutputUnitProperty_CurrentDevice && ioSettings[2].3 == 55)
+    do {
+        try configureIndependentIO(fakeUnit, selected: 55, setter: { _, _, _, _, _, _ in -50 })
+        throw AudioFailure("Failed input configuration was accepted")
+    } catch let error as AudioFailure {
+        guard error.description.contains("Enable capture input") else { throw error }
+    }
     // Input-layout changes remain fatal; only the unchanged mapping can resume.
     let captureDevice = fixture(10, kAudioDeviceTransportTypeAggregate)
     let blackholeDevice = fixture(11, kAudioDeviceTransportTypeVirtual)
@@ -835,39 +708,6 @@ func selfTest() throws {
         throw AudioFailure("Missing fallback was accepted")
     } catch let error as AudioFailure {
         guard error.description.contains("Cannot identify built-in speakers") else { throw error }
-    }
-    let silenceURL = FileManager.default.temporaryDirectory.appendingPathComponent("nilaris-gap-test-\(UUID().uuidString).caf")
-    defer { try? FileManager.default.removeItem(at: silenceURL) }
-    var gapDescription = captureClientDescription(sampleRate: 48000, channels: 3)
-    guard let gapLayout = AVAudioChannelLayout(layoutTag: kAudioChannelLayoutTag_DiscreteInOrder | 3),
-          let silenceFormat = AVAudioFormat(streamDescription: &gapDescription, channelLayout: gapLayout)
-        else { throw AudioFailure("Gap fixture format unavailable") }
-    do {
-        let silenceFile = try AVAudioFile(forWriting: silenceURL, settings: silenceFormat.settings)
-        guard let tone = AVAudioPCMBuffer(pcmFormat: silenceFormat, frameCapacity: 100),
-              let samples = tone.floatChannelData else { throw AudioFailure("Recovery PCM fixture unavailable") }
-        tone.frameLength = 100
-        for channel in 0..<3 { samples[channel].initialize(repeating: 0.25, count: 100) }
-        try silenceFile.write(from: tone)
-        try writeRecoverySilence(silenceFile, silenceFormat, frames: 2400)
-        try silenceFile.write(from: tone)
-        try expect(silenceFile.length == 2600)
-        do {
-            try writeRecoverySilence(silenceFile, silenceFormat, frames: 48000 * 16)
-            throw AudioFailure("Unbounded recovery gap was accepted")
-        } catch let error as AudioFailure {
-            guard error.description.contains("permitted audio gap") else { throw error }
-        }
-    }
-    let silenceRead = try AVAudioFile(forReading: silenceURL)
-    try expect(silenceRead.length == 2600 && silenceRead.processingFormat.channelCount == 3)
-    guard let recovered = AVAudioPCMBuffer(pcmFormat: silenceRead.processingFormat, frameCapacity: 2600)
-        else { throw AudioFailure("Recovery read fixture unavailable") }
-    try silenceRead.read(into: recovered)
-    guard let recoveredChannels = recovered.floatChannelData else { throw AudioFailure("Recovery PCM could not be read") }
-    for channel in 0..<3 {
-        try expect(recoveredChannels[channel][0] == 0.25 && recoveredChannels[channel][2599] == 0.25)
-        for frame in 100..<2500 { try expect(recoveredChannels[channel][frame] == 0) }
     }
     let clientFixture = captureClientDescription(sampleRate: 48000, channels: 3)
     try expect(clientFixture.mSampleRate == 48000 && clientFixture.mChannelsPerFrame == 3)
@@ -911,7 +751,7 @@ func selfTest() throws {
     } catch let error as AudioFailure {
         guard error.description.contains("Multiple Bluetooth") else { throw error }
     }
-    print("NILARIS_SELF_TEST_PASS: startup/format/policy/composition checks including mono Bluetooth and disconnect recovery; no settings changed")
+    print("NILARIS_SELF_TEST_PASS: input-only AUHAL configuration, channel mapping and playback policy checks; no settings changed")
 }
 do {
     if CommandLine.arguments.contains("--self-test") {

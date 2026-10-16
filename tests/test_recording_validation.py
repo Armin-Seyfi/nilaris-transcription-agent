@@ -45,12 +45,12 @@ class RecordingValidationTests(unittest.TestCase):
             stdout=['NILARIS_OUTPUT: WH-1000XM4\n',
                     'NILARIS_ROUTE_WARNING: Reconnecting audio; a short gap will be marked\n',
                     'NILARIS_OUTPUT: MacBook Pro Speakers\n',
-                    'NILARIS_ROUTE_WARNING: Audio resumed through MacBook Pro Speakers; 1.20s gap marked as silence\n']
+                    'NILARIS_ROUTE_WARNING: Capture continued; now listening through MacBook Pro Speakers. Brief remote-audio interruption is possible.\n']
         c._read_output(Output())
         status=c.get_status()
         self.assertEqual(status['state'],'recording')
         self.assertEqual(status['listening_device'],'MacBook Pro Speakers')
-        self.assertIn('1.20s gap',status['route_warning'])
+        self.assertIn('Capture continued',status['route_warning'])
 
 
 if __name__=='__main__':unittest.main()
